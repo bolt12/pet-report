@@ -1,0 +1,19 @@
+# Everything here would otherwise be uploaded to the daemon on every build.
+# dist-newstyle alone is hundreds of MB of local build products the image never
+# wants, since the backend stage builds from source in a clean container.
+.git
+.github
+backend/dist-newstyle
+frontend/node_modules
+frontend/dist
+result
+result-*
+docs
+nix
+flake.nix
+flake.lock
+tags
+Session.vim
+*.db
+*.sqlite
+.env

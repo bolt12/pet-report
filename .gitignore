@@ -1,0 +1,28 @@
+# Haskell
+dist-newstyle/
+*.hi
+*.o
+.ghc.environment.*
+
+# Nix
+result
+result-*
+
+# Frontend
+node_modules/
+frontend/dist/
+
+# Secrets and local state (never commit)
+.env
+*.db
+*.sqlite
+
+# Design notes kept locally, not published. Screenshots are still tracked.
+docs/*.md
+docs/redesign/
+
+# Editor / OS
+.DS_Store
+*.swp
+Session.vim
+tags

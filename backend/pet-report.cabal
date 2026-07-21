@@ -1,0 +1,198 @@
+cabal-version:      3.0
+name:               pet-report
+version:            0.1.0
+synopsis:           VLM-driven pet-activity monitor (backend)
+description:
+  Backend for pet-report: capture, batch analysis, and a Servant API.
+
+license:            AGPL-3.0-or-later
+author:             Armando Santos
+maintainer:         armandoifsantos@gmail.com
+build-type:         Simple
+
+-- Recorded Frigate responses the decoder tests read; declared so sdist and the
+-- nix build carry them (callCabal2nix filters undeclared files out).
+extra-source-files:
+  sql/*.sql
+  test/fixtures/*.json
+
+-- Shared language + warning settings (hs-bindgen style). Only
+-- `missing-deriving-strategies` is promoted to an error; the rest stay warnings.
+common lang
+  default-language:   GHC2021
+  default-extensions:
+    DeriveAnyClass
+    DerivingStrategies
+    DerivingVia
+    LambdaCase
+    MultiWayIf
+    OverloadedStrings
+    RecordWildCards
+    ViewPatterns
+
+  ghc-options:
+    -Wall -Wcompat -Wincomplete-uni-patterns
+    -Wincomplete-record-updates -Wpartial-fields -Widentities
+    -Wredundant-constraints -Wmissing-export-lists -Wunused-packages
+    -Werror
+
+-- The app-agnostic LLM harness: a provider-agnostic transport, the OpenAI-compatible
+-- backend, and the codec-to-schema bridge. An internal sub-library so it depends on nothing
+-- in PetReport.* (the compiler enforces the app-agnostic seam), and so it can be lifted into
+-- its own package later by moving this stanza to its own .cabal.
+library llm-harness
+  import:          lang
+  hs-source-dirs:  llm
+  exposed-modules:
+    LLM.Agent
+    LLM.Backend.OpenAI
+    LLM.Call
+    LLM.Exception
+    LLM.Schema
+    LLM.Trace
+    LLM.Transport
+
+  build-depends:
+    , aeson
+    , autodocodec
+    , autodocodec-schema
+    , base                >=4.18 && <5
+    , containers
+    , req
+    , stm
+    , text
+    , time
+
+library
+  import:          lang
+  hs-source-dirs:  src
+  exposed-modules:
+    PetReport.Analysis.Agent
+    PetReport.Analysis.IdentGuide
+    PetReport.Analysis.Narrative
+    PetReport.Analysis.Recap
+    PetReport.Analysis.Vision
+    PetReport.Analysis.Vocabulary
+    PetReport.App
+    PetReport.Config
+    PetReport.Domain.Behavior
+    PetReport.Domain.Observation
+    PetReport.Domain.Perception
+    PetReport.Domain.PetReport
+    PetReport.Domain.Profile
+    PetReport.Domain.Report
+    PetReport.Domain.Stats
+    PetReport.Domain.Trends
+    PetReport.Domain.Types
+    PetReport.Domain.View
+    PetReport.Domain.Window
+    PetReport.Effect.Clock
+    PetReport.Effect.Db
+    PetReport.Effect.Db.Browse
+    PetReport.Effect.Db.Gc
+    PetReport.Effect.Db.Handle
+    PetReport.Effect.Db.Migrations
+    PetReport.Effect.Db.Queries
+    PetReport.Effect.Db.Rollup
+    PetReport.Effect.Db.Sql
+    PetReport.Effect.Ffmpeg
+    PetReport.Effect.Frigate
+    PetReport.Effect.Http
+    PetReport.Effect.Llm
+    PetReport.Effect.Ntfy
+    PetReport.Effect.Probe
+    PetReport.Error
+    PetReport.Pipeline
+    PetReport.Pipeline.Queue
+    PetReport.Pipeline.Retention
+    PetReport.Pipeline.Scheduler
+    PetReport.Pipeline.Worker
+    PetReport.Trace
+    PetReport.Util
+    PetReport.View.Enrich
+    PetReport.Web
+    PetReport.Web.Cameras
+    PetReport.Web.Cleanup
+    PetReport.Web.Common
+    PetReport.Web.Days
+    PetReport.Web.Events
+    PetReport.Web.Keepsakes
+    PetReport.Web.Media
+    PetReport.Web.Moments
+    PetReport.Web.Ops
+    PetReport.Web.Pets
+    PetReport.Web.Settings
+    PetReport.Web.Types
+
+  -- Internal helper for Db.Queries; not part of the Db facade surface.
+  other-modules:   PetReport.Effect.Db.Facts
+  build-depends:
+    , aeson
+    , async
+    , autodocodec
+    , base               >=4.18 && <5
+    , base64-bytestring
+    , bytestring
+    , containers
+    , contra-tracer
+    , directory
+    , file-embed
+    , filepath
+    , http-media
+    , http-types
+    , llm-harness
+    , modern-uri
+    , mtl
+    , req
+    , resource-pool
+    , scientific
+    , servant-server
+    , sqlite-simple
+    , stm
+    , temporary
+    , text
+    , time
+    , typed-process
+    , tz
+    , wai
+    , warp
+
+executable pet-report
+  import:          lang
+  hs-source-dirs:  app
+  main-is:         Main.hs
+
+  -- Cabal-generated; supplies the package version behind `pet-report --version`.
+  other-modules:   Paths_pet_report
+  autogen-modules: Paths_pet_report
+  ghc-options:     -threaded -rtsopts -with-rtsopts=-N
+  build-depends:
+    , base
+    , optparse-applicative
+    , pet-report
+
+test-suite spec
+  import:         lang
+  type:           exitcode-stdio-1.0
+  hs-source-dirs: test
+  main-is:        Main.hs
+  other-modules:  Effects
+  build-depends:
+    , aeson
+    , async
+    , base
+    , bytestring
+    , containers
+    , filepath
+    , hedgehog
+    , llm-harness
+    , pet-report
+    , servant-server
+    , stm
+    , tasty
+    , tasty-hedgehog
+    , tasty-hunit
+    , temporary
+    , text
+    , time
+    , tz

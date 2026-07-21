@@ -1,0 +1,69 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Least-privilege token: CI only reads the checkout.
+permissions:
+  contents: read
+
+# A newer push to the same ref supersedes an in-flight run.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  backend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: DeterminateSystems/magic-nix-cache-action@main
+      - name: Build backend
+        run: nix build .#default --print-build-logs
+      # The tree is hint-clean, so this gates. Deliberate exceptions live in
+      # .hlint.yaml with their rationale rather than as a blanket allowance here.
+      - name: HLint
+        run: nix develop -c hlint backend/src backend/llm backend/app backend/test
+      - name: Flake checks (tests)
+        run: nix flake check --print-build-logs
+      - name: Build Docker image
+        run: nix build .#docker --print-build-logs
+
+  # The Dockerfile is the Nix-free route to the same container. Nothing else
+  # exercises it, so build it here or it rots: a dependency bump or a config
+  # change lands in flake.nix and the two silently diverge.
+  dockerfile:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      # Only the first run compiles the Haskell dependency set; after that the
+      # layer cache skips straight to the app build.
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  frontend:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Install
+        run: npm ci
+      - name: Typecheck (svelte-check)
+        run: npm run check
+      - name: Build
+        run: npm run build

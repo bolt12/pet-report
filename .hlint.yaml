@@ -1,0 +1,22 @@
+# Partial primitives are banned outright in the library and the executable: a
+# pattern that cannot fail should be expressed in the types, and one that can
+# should return Maybe/Either. The test suite is the single exception, and only
+# for `error`, where a malformed fixture is a bug in the test itself and dying
+# loudly beats threading a Maybe through a helper no production path calls.
+- functions:
+    - { name: error, within: [Effects, Main] }
+    - { name: undefined, within: [] }
+    - { name: head, within: [] }
+    - { name: fromJust, within: [] }
+
+- ignore: { name: "Use camelCase" }
+- ignore: { name: "Redundant do" }
+
+# TupleSections is deliberately not in the cabal `common lang` extension set, so
+# the rewrite hlint proposes here would not compile.
+- ignore: { name: "Use tuple-section" }
+
+# `maybe True (/= 0)` states the NULL-column rule the comment above it explains
+# ("a NULL predates the column: assume present"). The proposed `(Just 0 /=)` is
+# the same test spelled so the rule is no longer legible at the call site.
+- ignore: { name: "Redundant maybe", within: [PetReport.Effect.Db.Queries] }
