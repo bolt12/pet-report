@@ -38,7 +38,7 @@ import           Data.List           (sortOn)
 import           Data.Map.Strict     (Map)
 import qualified Data.Map.Strict     as Map
 import qualified Data.Set            as Set
-import           Data.Maybe          (fromMaybe, listToMaybe)
+import           Data.Maybe          (fromMaybe, isNothing, listToMaybe)
 import           Data.Ord            (Down (..))
 import           Data.Text           (Text)
 import           Data.Time           (UTCTime)
@@ -115,6 +115,28 @@ instance ToJSON BalanceV where
 -- speak. The constructor names avoid clashing with 'ChipKind''s Good and Watch.
 data WellbeingKind = Settled | Flagged
   deriving stock (Eq, Show, Bounded, Enum)
+
+-- | Why a pet is flagged. The labels name the reason rather than saying something
+-- task-shaped, because neither reason is a task: nothing an owner can click clears either
+-- one. Reviewing a moment sets its @reviewed@ flag, which drives the separate "moments to
+-- review" count and never touches this verdict. Both clear on their own when the data moves
+-- on, so a label that reads like a chore just sends the owner looking for a button that is
+-- not there.
+data WatchReason
+  = ConcernNoted
+  -- ^ An observation this week carried a concern, or a suspected accident or injury. Clears
+  -- when that observation ages out of the seven-day window.
+  | NoMealSeenToday
+  -- ^ Seen today, never at the bowl today, on a week where meals were seen on other days.
+  -- Clears the moment a meal is seen. "Seen" is the operative word: the cameras missing a
+  -- meal looks exactly like a skipped one, which is why the label says seen.
+  deriving stock (Eq, Show)
+
+-- | The owner-facing label for a reason, short enough for a chip.
+watchText :: WatchReason -> Text
+watchText r = case r of
+  ConcernNoted    -> "a concern this week"
+  NoMealSeenToday -> "no meals seen today"
 
 -- | The wire/DB string for a verdict. This is the closed vocabulary the frontend
 -- and the summaries cache depend on; keep it byte-identical.
@@ -258,11 +280,15 @@ insightsFrom tz ov crs roster ds pet weekObs =
       seen = psSightings todayStat
       restLots = restedALot todayStat
       spark = map psSightings weekStats
-      concerningWeek = psConcerns weekTotal > 0
-      -- Baseline is "ate on some earlier day this week". A rounded mean would collapse a
-      -- real 3-days-in-7 habit (mean 0.43) to 0 and never flag a skipped meal today.
-      belowMeals = seen > 0 && psAte todayStat == 0 && sum (map psAte weekStats) > 0
-      kind = if concerningWeek || belowMeals then Flagged else Settled
+      -- The reason is the single source of truth and the verdict is derived from it, so the
+      -- two cannot drift apart and claim a pet is flagged for nothing (or the reverse).
+      -- Baseline for meals is "ate on some earlier day this week". A rounded mean would
+      -- collapse a real 3-days-in-7 habit (mean 0.43) to 0 and never flag a skipped meal.
+      mwatch
+        | psConcerns weekTotal > 0 = Just ConcernNoted
+        | seen > 0 && psAte todayStat == 0 && sum (map psAte weekStats) > 0 = Just NoMealSeenToday
+        | otherwise = Nothing
+      kind = maybe Settled (const Flagged) mwatch
       rmDist = roomDistribution crs ov roster (petId pet) weekObs
       total = max 1 (sum (map snd rmDist))
    in PetInsights
@@ -272,13 +298,11 @@ insightsFrom tz ov crs roster ds pet weekObs =
         , piDescription = petDescription pet
         , piCaveat = petNotes pet
         , piSeen = seen
-        , piGlance = glanceChips seen todayStat restLots kind
+        , piGlance = glanceChips seen todayStat restLots mwatch
         , piNote =
             if seen == 0
               then Chip "Not seen yet" Info
-              else if kind == Flagged
-                then Chip "1 thing to look at" Watch
-                else Chip "Nothing of concern" Good
+              else maybe (Chip "Nothing of concern" Good) (\r -> Chip (watchText r) Watch) mwatch
         , piTiles = tilesFor todayStat
         , piSpark = spark
         , piHabits = habitsFor weekStats
@@ -301,15 +325,15 @@ insightsFrom tz ov crs roster ds pet weekObs =
 restedALot :: PetStat -> Bool
 restedALot st = psRest st * 2 >= max 1 (psSightings st)
 
-glanceChips :: Int -> PetStat -> Bool -> WellbeingKind -> [Chip]
+glanceChips :: Int -> PetStat -> Bool -> Maybe WatchReason -> [Chip]
 glanceChips 0 _ _ _ = []
-glanceChips seen st restLots kind =
+glanceChips seen st restLots mwatch =
   Chip ("seen " <> tshow seen <> "\215") Info
     : concat
       [ [Chip "ate" Good | psAte st > 0]
       , [Chip "drank" Good | psDrank st > 0]
-      , [Chip "rested a lot" Good | restLots && kind /= Flagged]
-      , [Chip "needs a peek" Watch | kind == Flagged]
+      , [Chip "rested a lot" Good | restLots && isNothing mwatch]
+      , maybe [] (\r -> [Chip (watchText r) Watch]) mwatch
       ]
 
 tilesFor :: PetStat -> [Tile]

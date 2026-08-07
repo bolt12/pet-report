@@ -123,7 +123,7 @@ enrichInsights app crs now monthTrs (pet, ins) = do
       weekSeen = sum (piSpark ins)
       daysSeen = length (filter (> 0) (piSpark ins))
       topSpot = case piSpots ins of (s : _) -> Just (spRoom s); _ -> Nothing
-      wbLine = wellbeingLine (piName ins) (wbKind (piWellbeing ins)) weekSeen (blRestPct (piBalance ins)) topSpot
+      wbLine = wellbeingLine (piName ins) weekSeen (blRestPct (piBalance ins)) topSpot
   pure
     ins
       { piWellbeing = (piWellbeing ins) {wbText = wbLine}

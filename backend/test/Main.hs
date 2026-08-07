@@ -650,9 +650,9 @@ viewUnits =
       elem "safety" (map chLabel (ovChips v)) @?= True
   , testCase "wellbeingLine hides a thin week, shows the shape of a full one" $ do
       -- Under 5 sightings this week is too thin to say anything.
-      wellbeingLine "Dexter" Settled 4 30 (Just "Office") @?= Nothing
+      wellbeingLine "Dexter" 4 30 (Just "Office") @?= Nothing
       -- At/over the threshold the line carries the name, count and rest pct.
-      case wellbeingLine "Dexter" Settled 5 30 (Just "Office") of
+      case wellbeingLine "Dexter" 5 30 (Just "Office") of
         Nothing -> assertFailure "expected a wellbeing line at 5 sightings"
         Just l -> do
           ("Dexter" `isInfixOf` l) @?= True
@@ -660,13 +660,15 @@ viewUnits =
           ("30%" `isInfixOf` l) @?= True
           -- The favourite room is named when present.
           ("most often in the Office" `isInfixOf` l) @?= True
-          -- A "good" kind ends on a plain full stop, no flagged-moment sentence.
-          ("flagged for a look" `isInfixOf` l) @?= False
-  , testCase "wellbeingLine appends the flagged-moment sentence for a watch" $
-      case wellbeingLine "Miso" Flagged 8 20 Nothing of
+  , testCase "wellbeingLine never claims a moment is flagged" $
+      -- It used to append "One moment is flagged for a look" for any watch verdict, which
+      -- was false when the verdict came from a missed meal: there is no such moment, and it
+      -- pointed the owner at a review queue that could be empty. The reason now lives on the
+      -- note and glance chips, which name it.
+      case wellbeingLine "Miso" 8 20 Nothing of
         Nothing -> assertFailure "expected a wellbeing line at 8 sightings"
         Just l -> do
-          ("One moment is flagged for a look." `isInfixOf` l) @?= True
+          ("flagged for a look" `isInfixOf` l) @?= False
           -- No top spot, so no "most often in" clause.
           ("most often in" `isInfixOf` l) @?= False
   , testCase "mkRecap pins Seen/Days seen to the live week, passes the rest through" $ do
