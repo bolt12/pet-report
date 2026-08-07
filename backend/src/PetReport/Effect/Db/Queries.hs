@@ -21,6 +21,8 @@ module PetReport.Effect.Db.Queries
   , purgePetAndProfile
   , getState
   , setState
+  , getIngestWatermark
+  , setIngestWatermark
   , insertReport
   , reportExists
   , latestReport
@@ -75,6 +77,7 @@ import           Database.SQLite.Simple         (Connection, Only (..),
                                                  (:.) (..))
 import           Database.SQLite.Simple.FromRow (FromRow (..))
 import           GHC.Generics                   (Generic)
+import           Text.Read                      (readMaybe)
 
 import           PetReport.Domain.Observation   (FrigateMeta (..),
                                                  NewObservation (..),
@@ -583,6 +586,22 @@ setState h key val = withConn h $ \c ->
     "INSERT INTO state (k, v) VALUES (?, ?) \
     \ON CONFLICT(k) DO UPDATE SET v = excluded.v"
     (key, val)
+
+-- | The ingest watermark: the POSIX-second @start_time@ the event sweep has advanced past.
+-- 'Nothing' before the first sweep has ever run, which is a fresh install rather than a
+-- stalled one, so the two stay distinguishable.
+--
+-- Typed here rather than left to each caller. The pipeline writes it and the web layer reads
+-- it to answer "is this day caught up", and a key string or a parse that drifted between the
+-- two would read as "never ingested" and quietly answer yes to everything.
+getIngestWatermark :: Handle -> IO (Maybe Double)
+getIngestWatermark h = (>>= readMaybe . T.unpack) <$> getState h ingestWatermarkKey
+
+setIngestWatermark :: Handle -> Double -> IO ()
+setIngestWatermark h = setState h ingestWatermarkKey . T.pack . show
+
+ingestWatermarkKey :: Text
+ingestWatermarkKey = "last_event_ts"
 
 -- | Store the report for its (day, period), refreshing the narrative in place if one
 -- already exists. The unique index makes this an upsert rather than a duplicate row.

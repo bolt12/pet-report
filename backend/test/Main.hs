@@ -799,7 +799,7 @@ contractUnits =
         @?= sort
           [ "pets", "report", "household", "cameras"
           , "frigateUrl", "modelUrl", "visionModel", "timeZone", "gcWindowDays"
-          , "configuredAt"
+          , "captureSecs", "configuredAt"
           ]
   , testCase "Pet JSON keys match the client contract" $
       jsonKeys (encode (Pet (PetId "p") "P" (Species "cat") "desc" Nothing Nothing Nothing))

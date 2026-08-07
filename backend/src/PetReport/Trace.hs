@@ -13,6 +13,7 @@ module PetReport.Trace
   , StartupEvent (..)
   , DbEvent (..)
   , PipelineEvent (..)
+  , SkipReason (..)
   , WebEvent (..)
   , NtfyEvent (..)
   , Tracer
@@ -100,11 +101,28 @@ data DbEvent
   -- @"browse"@, @"purge"@) and the decode error.
   deriving stock (Eq, Show)
 
+-- | Why an ingested Frigate event was skipped and left unstored, with the ingest watermark
+-- advancing past it. Each constructor is a distinct place a sighting silently disappears, so
+-- ingest can say which one a given event took instead of the drop being invisible.
+data SkipReason
+  = SkippedNoMedia
+  -- ^ A completed event carrying neither a snapshot nor a clip: nothing to analyse.
+  | SkippedCooldown
+  -- ^ Within the per-@(camera, label)@ cooldown of an already-stored sighting; deduped.
+  | SkippedFalsePositive
+  -- ^ Frigate flagged the event a false positive.
+  | SkippedAbandoned
+  -- ^ Its media stayed unreadable past the retry window, so ingest gave up rather than
+  -- freezing behind it forever.
+  deriving stock (Eq, Show)
+
 -- | Pipeline events: the capture/analyse/report/cleanup automation and the
 -- background worker and schedulers that drive it.
 data PipelineEvent
   = FramesQueued Int Int
-  -- ^ Queued N frames from M online cameras this capture pass.
+  -- ^ Queued N frames from M cameras this capture pass. M counts the cameras that were both
+  -- online and quiet, since one Frigate has just reported on is covered by that event and is
+  -- deliberately not sampled.
   | BatchAlreadyRunning
   -- ^ A batch was requested while one was already running; skipped.
   | BriefRefreshFailed Text
@@ -113,6 +131,23 @@ data PipelineEvent
   -- ^ The model was unreachable, so queued frames were deferred. Carries the error.
   | EventIngestFailed Text
   -- ^ Ingesting a Frigate event failed; the watermark held. Carries the error.
+  | EventsFetched Int Int Int
+  -- ^ Frigate returned N events for the ingest window @[after, before)@ (epoch seconds), the
+  -- pool the per-event 'EventSkipped' traces then account for. Together they tell an empty
+  -- window (nothing returned) apart from a full one whose events were all skipped.
+  | EventSkipped SkipReason Text Text
+  -- ^ An event (id, label) was NOT stored and the watermark advanced past it. The reason
+  -- names which silent-drop path it took, so a vanished sighting is explained in the log
+  -- rather than just missing from the report.
+  | IngestStalled Int
+  -- ^ A pass fetched N events and advanced the watermark past NONE of them, so the next pass
+  -- will re-fetch exactly the same window. One pass is ordinary (a budget ran out, media was
+  -- not ready yet); every pass means ingest is wedged and no sighting will ever be recorded.
+  -- 'EventsFetched' is Debug, so without this a stall is invisible at the default log level.
+  | IngestWatermarkStale Int
+  -- ^ The stored watermark was N days behind and has been floored at Frigate's own media
+  -- retention. Beyond that horizon the clips are gone, so those events could only be fetched,
+  -- found media-less and skipped, one budget unit at a time.
   | GcCollected Int Text
   -- ^ Cleanup collected N un-kept moments from the given day.
   | NoObservationsForReport
@@ -202,11 +237,19 @@ renderDb e = case e of
 renderPipeline :: PipelineEvent -> WithSeverity Text
 renderPipeline e = case e of
   FramesQueued saved cams ->
-    WithSeverity Debug ("queued " <> tshow saved <> " frame(s) from " <> tshow cams <> " online camera(s)")
+    WithSeverity Debug ("queued " <> tshow saved <> " frame(s) from " <> tshow cams <> " quiet camera(s)")
   BatchAlreadyRunning     -> WithSeverity Debug "another batch is already running; skipping"
   BriefRefreshFailed m    -> WithSeverity Warning ("brief refresh skipped: " <> m)
   ModelUnavailable m      -> WithSeverity Warning ("model unavailable; deferring queued frames: " <> m)
   EventIngestFailed m     -> WithSeverity Warning ("event ingest failed: " <> m)
+  EventsFetched n aft bef ->
+    WithSeverity Debug ("frigate returned " <> tshow n <> " event(s) for [" <> tshow aft <> ", " <> tshow bef <> ")")
+  EventSkipped reason eid lbl ->
+    WithSeverity (skipSeverity reason) ("event " <> eid <> " (" <> lbl <> ") not stored: " <> skipText reason)
+  IngestStalled n ->
+    WithSeverity Warning ("ingest made no progress: " <> tshow n <> " event(s) fetched, watermark unmoved")
+  IngestWatermarkStale d ->
+    WithSeverity Warning ("ingest watermark was " <> tshow d <> " day(s) stale; clamped to frigate's media retention")
   GcCollected n day       -> WithSeverity Info ("gc: collected " <> tshow n <> " un-kept moment(s) from " <> day)
   NoObservationsForReport -> WithSeverity Debug "no observations for that day; skipping report"
   ReportStored pushed     -> WithSeverity Info (if pushed then "report stored and pushed" else "report stored")
@@ -214,6 +257,23 @@ renderPipeline e = case e of
   SchedulerStepFailed w m -> WithSeverity Warning (w <> " skipped: " <> m)
   RetentionUpdated s      -> WithSeverity Info ("frigate media retention updated: " <> s)
   JobFailed lbl m         -> WithSeverity Warning (lbl <> " failed: " <> m)
+
+-- | The severity a skip traces at. A cooldown dedup or a Frigate-flagged false positive is
+-- routine 'Debug'; a completed event dropped for want of any media is 'Info' (a real sighting
+-- that never lands); an event abandoned unread past the retry window is a 'Warning'.
+skipSeverity :: SkipReason -> Severity
+skipSeverity r = case r of
+  SkippedCooldown      -> Debug
+  SkippedFalsePositive -> Debug
+  SkippedNoMedia       -> Info
+  SkippedAbandoned     -> Warning
+
+skipText :: SkipReason -> Text
+skipText r = case r of
+  SkippedNoMedia       -> "completed event has no snapshot or clip to analyse"
+  SkippedCooldown      -> "within cooldown of a recent sighting on the same camera and label"
+  SkippedFalsePositive -> "frigate flagged it a false positive"
+  SkippedAbandoned     -> "media stayed unreadable past the retry window"
 
 renderWeb :: WebEvent -> WithSeverity Text
 renderWeb e = case e of

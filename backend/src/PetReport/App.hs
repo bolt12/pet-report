@@ -10,6 +10,7 @@ module PetReport.App
   , appBatchLock
   , withApp
   , refreshSettings
+  , applyProfile
   ) where
 
 import           Control.Concurrent.MVar   (MVar, newMVar)
@@ -182,4 +183,7 @@ applyProfile prof cfg =
     , cfgCameras = case filter (not . T.null) (enabledCameras prof) of
         []   -> cfgCameras cfg
         cams -> map Camera cams
+    , -- A one-minute floor matches what the capture loop enforces anyway, so a profile
+      -- cannot ask for a pass rate the scheduler will not honour.
+      cfgCaptureSecs = maybe (cfgCaptureSecs cfg) (fromIntegral . max 60) (captureSecs prof)
     }

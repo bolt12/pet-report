@@ -14,6 +14,7 @@ import           Data.Aeson             (Value, decodeStrict, object, (.=))
 import           Data.Text              (Text)
 import           Data.Text.Encoding     (encodeUtf8)
 import           Data.Time              (UTCTime, addUTCTime)
+import           Data.Time.Clock.POSIX  (posixSecondsToUTCTime)
 import           Data.Time.Zones        (TZ)
 import           Servant                (Handler)
 
@@ -22,7 +23,8 @@ import qualified PetReport.Analysis.Narrative  as Narrative
 import qualified PetReport.Analysis.IdentGuide as IdentGuide
 import           PetReport.App                 (App (..), appJobs)
 import           PetReport.Domain.Types        (ObsId (..))
-import           PetReport.Domain.Window       (localDayOf, recognizedArg,
+import           PetReport.Domain.Window       (localDayOf, localDayWindow,
+                                                recognizedArg,
                                                 resolveDay)
 import qualified PetReport.Effect.Clock        as Clock
 import qualified PetReport.Effect.Db           as Db
@@ -134,5 +136,32 @@ batchH app mday = liftIO $ do
     Right job -> jobRunning (appJobs app) job
     Left _    -> pure False
   mlast <- Db.getState (appDb app) "last_batch"
+  caught <- caughtUpOn app tz now mday
   let lastVal = mlast >>= (decodeStrict . encodeUtf8) :: Maybe Value
-  pure (object ["running" .= running, "last" .= lastVal])
+  pure (object ["running" .= running, "last" .= lastVal, "caughtUp" .= caught])
+
+-- | Whether every event of the day in question has been looked at yet.
+--
+-- The test is the ingest watermark against the END of that day, never against "now". A
+-- caught-up system's watermark is legitimately hours old between batches, so comparing with
+-- now would report the app as behind twice a day, every day, and the notice would be noise
+-- within a week.
+--
+-- A day still in progress is caught up once the watermark reaches the present, which is what
+-- comparing against @min dayEnd now@ gives. No watermark at all reads as caught up: a fresh
+-- install has nothing outstanding, and saying otherwise on first run would be a lie the owner
+-- cannot act on.
+caughtUpOn :: App -> TZ -> UTCTime -> Maybe Text -> IO Bool
+caughtUpOn app tz now mday = do
+  stored <- Db.getIngestWatermark (appDb app)
+  case stored of
+    Nothing -> pure True
+    Just secs -> do
+      -- Resolved exactly as 'resolveRefresh' resolves it, so the notice and the refresh
+      -- button can never disagree about which day they mean.
+      let day = case mday of
+            Just raw | recognizedArg raw -> resolveDay tz now raw
+            _                            -> localDayOf tz now
+          (_, dayEnd) = localDayWindow tz now day
+          wm = posixSecondsToUTCTime (realToFrac secs)
+      pure (wm >= min dayEnd now)

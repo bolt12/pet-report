@@ -10,9 +10,9 @@ module Effects
 
 import           Control.Concurrent.MVar (newMVar)
 import           Control.Concurrent.STM  (atomically, newTVarIO, writeTVar)
-import           Control.Monad            (void)
+import           Control.Monad            (forM_, void)
 import           Data.List               (sort, sortOn)
-import           Data.Maybe              (mapMaybe)
+import           Data.Maybe              (fromMaybe, mapMaybe)
 import           Data.Ord                (Down (..))
 import           Control.Exception       (IOException, SomeException, throwIO,
                                           try)
@@ -28,6 +28,7 @@ import           Data.Text               (Text)
 import qualified Data.Text               as T
 import qualified Data.Text.Encoding      as TE
 import           Data.Time               (UTCTime (..), fromGregorian)
+import           Data.Time.Zones         (utcTZ)
 import           Data.Time.Clock.POSIX   (utcTimeToPOSIXSeconds)
 
 import           Hedgehog            (Property, forAll, property, (===))
@@ -46,7 +47,8 @@ import           LLM.Agent       (renderResult)
 import           LLM.Call        (Call (..), Sampling (..), runRepair, structured,
                                   userText)
 
-import           PetReport.App                (App (..), EffSettings (..),
+import           PetReport.App                (App (..), EffSettings (..), appRetention,
+                                               applyProfile,
                                                Runtime (..), appSettings)
 import           PetReport.Config             (Config (..), mkHour, parseListen,
                                                portNumber)
@@ -56,10 +58,13 @@ import           PetReport.Domain.Observation (FrigateMeta (..),
                                                Observation (..), Origin (..))
 import           PetReport.Domain.Perception  (Appearance (..), Perception (..),
                                                Scene (..), Who (..), emptyScene)
+import           PetReport.Domain.Stats        (appearancesOf)
+import           PetReport.Domain.Report      (Period (..), Report (..))
 import           PetReport.Domain.Profile     (CameraRoom (..), Pet (..),
                                                Profile (..), emptyProfile)
 import           PetReport.Domain.Types       (Activity (..), BaseUrl (..),
                                                Camera (..), EventId (..),
+                                               cameraText,
                                                ModelName (..), ObsId (..),
                                                PetId (..), Species (..))
 import qualified PetReport.Analysis.Agent     as Agent
@@ -78,6 +83,7 @@ import           PetReport.Effect.Llm         (ChatRequest (..),
 import qualified PetReport.Effect.Llm         as Llm
 import qualified PetReport.Effect.Ntfy        as Ntfy
 import qualified PetReport.Pipeline           as Pipeline
+import           PetReport.Pipeline.Queue     (listJpgs, writeQueueFrame)
 import           PetReport.Trace              (dbTracer, ntfyTracer,
                                                renderingTracer)
 import qualified PetReport.Web                as Web
@@ -408,6 +414,215 @@ pipelineUnits =
         _ <- Pipeline.ingestWindow (withEvents [evB]) budget prof (posixSecs t0 + 1) (posixSecs t0 + 400)
         afterSecond <- countStored
         (afterFirst, afterSecond) @?= (1, 1)
+  , testCase "a queue full of frames and a waiting event both get processed" $
+      -- The end-to-end shape of the fix that ended a month of ingesting nothing: a batch
+      -- with plenty of queued frames still ingests the event. What guarantees it is the
+      -- reservation below, tested directly; this pins that the two stages actually both
+      -- run in one batch.
+      withFakeApp id $ \app0 -> do
+        Db.putProfile (appDb app0) catProfile
+        now <- Clock.now (appClock app0)
+        let ev = audioEvent {feId = "not-starved", feStart = posixSecs now - 60}
+            app =
+              app0
+                { appFrigate = fakeFrigate {Frigate.recentEvents = \_ _ _ _ -> pure (Just [ev])}
+                , appLlm = fakeLlm (const (pure (answer sceneReply)))
+                }
+        forM_ [1 .. 20 :: Int] $ \i ->
+          writeQueueFrame (appConfig app) "office" (round (posixSecs now) - toInteger i) "jpeg-bytes"
+        Pipeline.batch app
+        obss <- Db.observationsBetween (appDb app) (addSecs (-3600) now) (addSecs 3600 now)
+        assertBool
+          "the frigate event was ingested alongside the queued frames"
+          (any ((== "sound") . perceptionKind) obss)
+        assertBool
+          "the queued frames were analysed too"
+          (any ((== "scene") . perceptionKind) obss)
+  , testCase "events are capped before the deadline so samples always get a turn" $
+      -- The reservation, tested where it lives. Events run first, so they cannot be
+      -- starved; capping them short of the deadline is what leaves the rest of the window
+      -- for the samples that follow. Past the event instant but before the deadline, one
+      -- stage must be refused and the other allowed.
+      withFakeApp id $ \app0 -> do
+        clockRef <- newIORef (UTCTime (fromGregorian 2026 8 6) 0)
+        let app = app0 {appClock = Clock.Handle {Clock.now = readIORef clockRef, Clock.timeZone = pure utcTZ}}
+            atMinute m = modifyIORef' clockRef (const (UTCTime (fromGregorian 2026 8 6) (m * 60)))
+        budget <- Pipeline.newBudget app
+        -- Fresh: both stages may work.
+        (,) <$> Pipeline.takeBudget Pipeline.Events budget <*> Pipeline.takeBudget Pipeline.Samples budget
+          >>= (@?= (True, True))
+        -- Past 70% of a 20-minute window, events stop and samples carry on.
+        atMinute 15
+        (,) <$> Pipeline.takeBudget Pipeline.Events budget <*> Pipeline.takeBudget Pipeline.Samples budget
+          >>= (@?= (False, True))
+        -- Past the deadline, nothing starts.
+        atMinute 21
+        (,) <$> Pipeline.takeBudget Pipeline.Events budget <*> Pipeline.takeBudget Pipeline.Samples budget
+          >>= (@?= (False, False))
+  , testCase "the watermark is floored at frigate's retention, and only when it is behind it" $
+      -- Beyond the retention horizon the media is gone, so those events can only be
+      -- fetched, found media-less and skipped, a budget unit each. A watermark left weeks
+      -- behind would spend batch after batch grinding through history it can never analyse
+      -- while today's events wait behind it. Inside the horizon nothing is touched, since
+      -- clamping there would discard real, still-fetchable history.
+      withFakeApp id $ \app -> do
+        let nowP = 1000000000 :: Double
+            daysBack d = nowP - d * 86400
+            setRetention = atomically . writeTVar (appRetention app) . Map.fromList
+        -- Two cameras: the floor follows the LONGEST retention, so an event still held by
+        -- one camera is not discarded for the sake of the other.
+        setRetention [("office", 3), ("hall", 7)]
+        stale <- Pipeline.clampToRetention app nowP (Just (daysBack 30))
+        inside <- Pipeline.clampToRetention app nowP (Just (daysBack 2))
+        (nowP - stale) / 86400 @?= 7
+        inside @?= daysBack 2
+        -- Never set (a fresh install) starts at the horizon rather than sweeping all of
+        -- history, and is not a stall, so it must not be reported as one.
+        fresh <- Pipeline.clampToRetention app nowP Nothing
+        (nowP - fresh) / 86400 @?= 7
+        -- Retention unknown (a config read that has never succeeded): guessing a floor
+        -- here would silently discard history, so nothing is clamped.
+        setRetention []
+        unknown <- Pipeline.clampToRetention app nowP (Just (daysBack 30))
+        unknown @?= daysBack 30
+  , testCase "capture samples the quiet camera and leaves the busy one to its events" $
+      -- A sample is the fallback for a stretch Frigate said nothing about. Frigate has just
+      -- reported on office, and that event carries a real detection and a clip, so a blind
+      -- snapshot of the same room adds nothing and only crowds the queue. hall has been
+      -- silent, which is exactly the gap sampling exists to cover.
+      withFakeApp id $ \app0 -> do
+        Db.putProfile
+          (appDb app0)
+          catProfile {cameras = [CameraRoom "office" "Office" True, CameraRoom "hall" "Hall" True]}
+        now <- Clock.now (appClock app0)
+        let onOffice = audioEvent {feCamera = "office", feStart = posixSecs now - 60}
+            app =
+              app0
+                { appFrigate =
+                    fakeFrigate
+                      { Frigate.onlineCameras = pure
+                      , Frigate.recentEvents = \_ _ _ _ -> pure (Just [onOffice])
+                      , Frigate.latestFrame = \_ -> pure (Just "jpeg-bytes")
+                      }
+                }
+            queueOf cam = listJpgs (cfgQueueDir (appConfig app) </> cam)
+        Pipeline.capture app
+        officeQ <- queueOf "office"
+        hallQ <- queueOf "hall"
+        (length officeQ, length hallQ) @?= (0, 1)
+  , testCase "queued frames are analysed camera by camera in turn, not one camera at a time" $
+      -- Drained camera by camera, a batch that runs short does every office frame and never
+      -- reaches hall, the same camera losing every time because the order is stable.
+      -- Observation ids are handed out in insertion order, so the stored sequence of cameras
+      -- IS the processing order: alternating means interleaved, grouped means sequential.
+      withFakeApp id $ \app0 -> do
+        Db.putProfile
+          (appDb app0)
+          catProfile {cameras = [CameraRoom "office" "Office" True, CameraRoom "hall" "Hall" True]}
+        now <- Clock.now (appClock app0)
+        let app =
+              app0
+                { appFrigate = fakeFrigate {Frigate.recentEvents = \_ _ _ _ -> pure (Just [])}
+                , appLlm = fakeLlm (const (pure (answer sceneReply)))
+                }
+            base = round (posixSecs now) :: Integer
+        forM_ [1 .. 3 :: Int] $ \i -> do
+          writeQueueFrame (appConfig app) "office" (base - toInteger i) "jpeg-bytes"
+          writeQueueFrame (appConfig app) "hall" (base - toInteger i) "jpeg-bytes"
+        Pipeline.batch app
+        obss <- Db.observationsBetween (appDb app) (addSecs (-3600) now) (addSecs 3600 now)
+        let order = map (cameraText . camera) (sortOn obsId obss)
+        order @?= ["office", "hall", "office", "hall", "office", "hall"]
+  , testCase "a day whose events arrive late gets its story rewritten, silently" $
+      -- finishReport only ever writes today, so a day ingested while half-finished keeps the
+      -- narrative it was given: the timeline and stats heal on their own, the prose does not.
+      -- Here yesterday already has a report, then yesterday's events land in this batch, so
+      -- the report must be replaced. Silently: a repaired day must not re-push a
+      -- notification, which would tell the owner about a day they were told about already.
+      -- A fixed clock, so which local day the late event lands in does not depend on what
+      -- time the suite happens to run.
+      withFakeApp id $ \app0 -> do
+        Db.putProfile (appDb app0) catProfile
+        pushes <- newIORef (0 :: Int)
+        let fixedNow = UTCTime (fromGregorian 2026 8 6) (12 * 3600)
+            yesterday = fromGregorian 2026 8 5
+            lateEv = audioEvent {feId = "late", feStart = posixSecs (UTCTime yesterday (16 * 3600))}
+            app =
+              app0
+                { appClock = Clock.Handle {Clock.now = pure fixedNow, Clock.timeZone = pure utcTZ}
+                , appFrigate = fakeFrigate {Frigate.recentEvents = \_ _ _ _ -> pure (Just [lateEv])}
+                , appLlm = fakeLlm (const (pure (answer "a quiet day")))
+                , appNtfy = Ntfy.Handle {Ntfy.push = \_ -> modifyIORef' pushes (+ 1)}
+                }
+        -- Yesterday's story as first written, while its events were still un-ingested.
+        Db.insertReport
+          (appDb app)
+          Report {reportDay = yesterday, period = Evening, narrative = "nothing happened", reportAt = fixedNow}
+        -- Wind the watermark back to the start of yesterday so this pass sweeps it.
+        Db.setIngestWatermark (appDb app) (posixSecs (UTCTime yesterday 0))
+        Pipeline.batch app
+        stored <- Db.latestReport (appDb app) yesterday
+        assertBool
+          ("yesterday's narrative was replaced once its events landed, got " <> show stored)
+          (stored /= Just "nothing happened")
+        -- Today has no observations, so the only report written was the repair, and a repair
+        -- must never push: the owner was already told about that day.
+        readIORef pushes >>= (@?= 0)
+  , testCase "a queued frame from a past day rewrites that day's story too" $
+      -- The repair has to come after BOTH stages, not just after ingest. Everything capture
+      -- queues between the evening batch and midnight belongs to that day and is analysed
+      -- the next morning, so a repair that ran between ingest and the queue would rewrite
+      -- yesterday and then bury it under the samples that landed a moment later.
+      --
+      -- No events at all here, so the only thing that can move yesterday's story is the
+      -- queued frame.
+      withFakeApp id $ \app0 -> do
+        Db.putProfile (appDb app0) catProfile
+        let fixedNow = UTCTime (fromGregorian 2026 8 6) (12 * 3600)
+            yesterday = fromGregorian 2026 8 5
+            app =
+              app0
+                { appClock = Clock.Handle {Clock.now = pure fixedNow, Clock.timeZone = pure utcTZ}
+                , appFrigate = fakeFrigate {Frigate.recentEvents = \_ _ _ _ -> pure (Just [])}
+                , appLlm = fakeLlm (const (pure (answer sceneReply)))
+                }
+        Db.insertReport
+          (appDb app)
+          Report {reportDay = yesterday, period = Evening, narrative = "nothing happened", reportAt = fixedNow}
+        Db.setIngestWatermark (appDb app) (posixSecs (UTCTime yesterday 0))
+        -- Queued at 22:00 yesterday, the shape of a frame taken after the evening batch.
+        writeQueueFrame (appConfig app) "office" (round (posixSecs (UTCTime yesterday (22 * 3600)))) "jpeg-bytes"
+        Pipeline.batch app
+        stored <- Db.latestReport (appDb app) yesterday
+        assertBool
+          ("yesterday's narrative was replaced once its queued frame was analysed, got " <> show stored)
+          (stored /= Just "nothing happened")
+  , testCase "a person event is fetched and stored, and never counts as a pet sighting" $
+      -- The whole point of fetching people is the pet sitter arriving. Which labels are
+      -- fetched is config; who is in the frame is the model's call, and a person resolves to
+      -- its own stats bucket, so a visitor cannot land in a pet's meals or rest.
+      withFakeApp id $ \app0 -> do
+        askedFor <- newIORef ([] :: [Text])
+        let personEv = mkEvent {feId = "sitter", feLabel = "person", feHasSnapshot = True}
+            app =
+              app0
+                { appFrigate =
+                    fakeFrigate
+                      { Frigate.recentEvents = \labels _ _ _ -> do
+                          modifyIORef' askedFor (const labels)
+                          pure (Just [personEv])
+                      , Frigate.eventSnapshot = \_ -> pure (Just "jpeg-bytes")
+                      }
+                , appLlm = fakeLlm (const (pure (answer personReply)))
+                }
+        budget <- Pipeline.newBudget app
+        _ <- Pipeline.ingestWindow app budget catProfile (posixSecs t0) (posixSecs (addSecs 100000 t0))
+        labels <- readIORef askedFor
+        assertBool ("person is among the fetched labels, got " <> show labels) ("person" `elem` labels)
+        obss <- Db.observationsBetween (appDb app) t0 (addSecs 100000 t0)
+        map perceptionKind obss @?= ["scene"]
+        -- The appearance is a person, so no pet subject picks it up.
+        map who (concatMap appearancesOf obss) @?= [APerson]
   ]
   where
     prof = catProfile
@@ -420,6 +635,13 @@ sceneReply :: Text
 sceneReply =
   TE.decodeUtf8 . LBS.toStrict . encode $
     emptyScene {appearances = [Appearance (AnAnimal (Species "cat")) Sleeping noBehaviors Nothing]}
+
+-- The same, but the frame holds a person rather than an animal: what a person event's
+-- snapshot analyses to.
+personReply :: Text
+personReply =
+  TE.decodeUtf8 . LBS.toStrict . encode $
+    emptyScene {appearances = [Appearance APerson Walking noBehaviors Nothing]}
 
 -- --------------------------------------------------------------------------- --
 -- (e) Web handlers
@@ -545,7 +767,27 @@ contractHandlerUnits =
         r <- runHandler (Web.batchH app Nothing)
         case r of
           Left e  -> assertFailure ("batchH failed: " <> show e)
-          Right v -> jsonKeysV (encode v) @?= sort ["running", "last"]
+          Right v -> jsonKeysV (encode v) @?= sort ["running", "last", "caughtUp"]
+  , testCase "caughtUp compares the watermark to the day's end, not to the clock" $
+      -- Between batches a caught-up app's watermark is legitimately hours old. Comparing it
+      -- with "now" would report the app as behind twice a day forever, and a notice that
+      -- cries wolf is worse than none.
+      withFakeApp id $ \app0 -> do
+        let fixedNow = UTCTime (fromGregorian 2026 8 6) (12 * 3600)
+            app = app0 {appClock = Clock.Handle {Clock.now = pure fixedNow, Clock.timeZone = pure utcTZ}}
+            caughtUpFor raw = do
+              r <- runHandler (Web.batchH app raw)
+              case r of
+                Left e  -> assertFailure ("batchH failed: " <> show e) >> pure Null
+                Right v -> pure (fromMaybe Null (KeyMap.lookup "caughtUp" (objOf v)))
+        -- No watermark at all: a fresh install has nothing outstanding.
+        caughtUpFor Nothing >>= (@?= Bool True)
+        -- Swept up to 08:00 today, four hours before "now": today is NOT done.
+        Db.setIngestWatermark (appDb app) (posixSecs (UTCTime (fromGregorian 2026 8 6) (8 * 3600)))
+        caughtUpFor Nothing >>= (@?= Bool False)
+        -- That same watermark is past the END of yesterday, so yesterday IS done, even
+        -- though the watermark is many hours older than the clock.
+        caughtUpFor (Just "2026-08-05") >>= (@?= Bool True)
   , testCase "statusH JSON keys match the client contract (Status)" $
       -- Point the EffSettings at a refused port so the two probes fail instantly
       -- rather than waiting for the 5s timeout in Probe.reachable.
@@ -583,6 +825,16 @@ configUnits =
       parseListen "garbage" @?= Nothing
       parseListen ":8116" @?= Nothing
       parseListen "host:0" @?= Nothing
+  , testCase "a profile capture interval overrides the env default, with a one-minute floor" $ do
+      -- The interval is an in-app setting, so it goes through the same profile-over-env
+      -- resolution as the URLs and the timezone rather than a second mechanism. The floor
+      -- matches what the capture loop enforces anyway, so a profile cannot ask for a rate
+      -- the scheduler would silently ignore.
+      let base = fakeConfig "/unused"
+          withCapture s = applyProfile emptyProfile {captureSecs = s} base
+      cfgCaptureSecs (withCapture Nothing) @?= 600
+      cfgCaptureSecs (withCapture (Just 1800)) @?= 1800
+      cfgCaptureSecs (withCapture (Just 5)) @?= 60
   ]
 
 -- --------------------------------------------------------------------------- --
@@ -685,6 +937,7 @@ fakeConfig dir =
     , cfgCameras = [Camera "office"]
     , cfgPetLabels = ["dog", "cat"]
     , cfgAudioLabels = ["speech", "bark", "meow"]
+    , cfgPersonLabels = ["person"]
     , cfgRetentionPollSecs = 900
     , cfgMediaDir = dir </> "media"
     , cfgCaptureSecs = 600

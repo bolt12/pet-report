@@ -166,6 +166,11 @@ data Profile = Profile
   -- ^ How many days of raw moments to keep before garbage-collecting the un-kept ones.
   -- Their durable per-day stats and any kept moments remain. Honoured literally at a
   -- one-day minimum, so shortening it actually takes effect. Default 30.
+  , captureSecs  :: Maybe Int
+  -- ^ Seconds between capture passes, overriding the @PET_REPORT_CAPTURE_SECS@ env default
+  -- when set. How often a camera Frigate has been quiet on gets a blind sample, so it trades
+  -- coverage of an uneventful stretch against the number of near-identical moments to page
+  -- through. 'Nothing' falls back to the env value.
   , configuredAt :: Maybe UTCTime
   -- ^ 'Nothing' until the owner completes the setup wizard.
   }
@@ -184,6 +189,7 @@ instance FromJSON Profile where
       <*> o .:? "visionModel"
       <*> o .:? "timeZone"
       <*> o .:? "gcWindowDays" .!= 30
+      <*> o .:? "captureSecs"
       <*> o .:? "configuredAt"
 
 emptyProfile :: Profile
@@ -198,6 +204,7 @@ emptyProfile =
     , visionModel = Nothing
     , timeZone = Nothing
     , gcWindowDays = 30
+    , captureSecs = Nothing
     , configuredAt = Nothing
     }
 

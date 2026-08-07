@@ -14,6 +14,9 @@ module PetReport.Pipeline
   , ingestWindowSafe
   , Budget
   , newBudget
+  , Stage (..)
+  , takeBudget
+  , clampToRetention
   , RunOutcome (..)
   , runOutcomeText
   , gcEffectiveWindow
@@ -24,12 +27,13 @@ import qualified Control.Concurrent.Async as Async
 import           Control.Concurrent.MVar  (MVar, putMVar, tryTakeMVar)
 import           Control.Exception        (SomeException, bracket, handle,
                                            throwIO, try)
-import           Control.Monad            (foldM, forM_, unless, void)
+import           Control.Concurrent.STM   (readTVarIO)
+import           Control.Monad            (foldM, forM_, unless, void, when)
 import           Data.Aeson               (object, (.=))
 import           Data.Aeson.Text          (encodeToLazyText)
 import           Data.IORef               (IORef, atomicModifyIORef',
                                            newIORef, readIORef)
-import           Data.List                (sort)
+import           Data.List                (sort, transpose)
 import           Data.Map.Strict          (Map)
 import qualified Data.Map.Strict          as Map
 import           Data.Maybe               (fromMaybe, isJust, mapMaybe)
@@ -42,11 +46,11 @@ import           Data.Time                (Day, NominalDiffTime, UTCTime,
 import           Data.Time.Clock.POSIX    (posixSecondsToUTCTime,
                                            utcTimeToPOSIXSeconds)
 import           Data.Time.LocalTime      (localTimeOfDay, todHour)
-import           Data.Time.Zones          (utcToLocalTimeTZ)
+import           Data.Time.Zones          (TZ, utcToLocalTimeTZ)
 import           System.FilePath          ((</>))
-import           Text.Read                (readMaybe)
 
-import           PetReport.App                 (App (..), appBatchLock)
+import           PetReport.App                 (App (..), appBatchLock,
+                                                appRetention)
 import           PetReport.Config              (Config (..))
 import           PetReport.Domain.Behavior     (Behaviors (..),
                                                 accidentSuspected,
@@ -83,8 +87,8 @@ import           PetReport.Pipeline.Queue      (listJpgs, moveToProof, removeQui
 import qualified PetReport.Analysis.Recap      as Recap
 import qualified PetReport.Analysis.IdentGuide as IdentGuide
 import           PetReport.Util                (boundedLines, tshow)
-import           PetReport.Trace               (PipelineEvent (..), Tracer,
-                                                pipelineTracer, traceWith)
+import           PetReport.Trace               (PipelineEvent (..), SkipReason (..),
+                                                Tracer, pipelineTracer, traceWith)
 import qualified PetReport.Analysis.Vision     as Vision
 
 -- Tunables (candidates to move into Config later).
@@ -107,21 +111,16 @@ eventClipFrames = 6
 eventRetryWindowSec :: Double
 eventRetryWindowSec = 6 * 3600
 
--- | The most vision-bearing items, queued frames plus Frigate events, one batch will
--- analyse. Anything past this defers to the next batch, with frames left queued and the
--- event watermark frozen, so a slow model or a burst cannot make one run unbounded and leave
--- the refresh spinner hanging for many minutes.
-batchItemCap :: Int
-batchItemCap = 50
-
--- | The wall-clock ceiling on one batch's item processing. The item cap alone does not bound
--- time: 50 items at the background budget's ~180s worst case is roughly two and a half
--- hours, all of it on the single worker thread with every queued refresh and rebuild waiting
--- behind it.
+-- | The wall-clock ceiling on one batch's item processing, and the only bound there is.
+--
+-- This used to sit alongside an item cap, which was dropped because it bounded the wrong
+-- thing: an item is one picture for a queued frame but a snapshot plus 'eventClipFrames'
+-- more for an event, so a fixed count was anywhere from a minute of work to a couple of
+-- hours. What has to be bounded is how long the single batch worker is held, since every
+-- on-demand refresh and day rebuild queues behind it, and that is exactly what this bounds.
 --
 -- Past the deadline a slow-model run defers its remainder and records an honest "ok"
--- outcome. This generalizes the item cap, since both stop taking NEW items and route through
--- the same 'frozen' path.
+-- outcome, stopping at the same 'frozen' path a spent allowance always took.
 batchDeadlineSecs :: NominalDiffTime
 batchDeadlineSecs = 20 * 60
 
@@ -131,6 +130,27 @@ batchDeadlineSecs = 20 * 60
 -- day, so a normal batch drains in one request.
 eventFetchLimit :: Int
 eventFetchLimit = 500
+
+-- | How recently Frigate must have reported on a camera for 'capture' to leave it alone.
+--
+-- Samples are the fallback for stretches Frigate says nothing about, so this is the length of
+-- silence that counts as a gap worth filling. Too short and the queue fills with frames of
+-- rooms the events already cover, crowding out the ingest they are meant to supplement; too
+-- long and a genuinely quiet afternoon goes unrecorded.
+captureQuietSecs :: Double
+captureQuietSecs = 3600
+
+-- | The Frigate labels this app ingests: pet object labels, audio labels, and person labels.
+--
+-- Shared by the ingest window and by 'capture's quiet check, which must agree. If capture
+-- asked about a wider set than ingest stores, a camera would count as busy on an event that
+-- never becomes an observation, and the gap it was meant to cover would go unsampled.
+--
+-- People are ingested as themselves, not as pets. The label only decides what is fetched;
+-- who is in the frame is decided by the model, and a person resolves to its own stats
+-- bucket, so a visitor cannot land in a pet's meals or rest.
+ingestLabels :: Config -> [Text]
+ingestLabels cfg = cfgPetLabels cfg ++ cfgAudioLabels cfg ++ cfgPersonLabels cfg
 
 -- | A hair below Frigate's start_time resolution, for re-including boundary ties. The
 -- watermark is nudged this far below the last event, so the next pass, whose @after@ is
@@ -157,37 +177,75 @@ advanceWatermark lo frozen got foldMax hi
   | frozen || got >= eventFetchLimit = max lo (foldMax - cursorEpsilon)
   | otherwise                        = max foldMax hi
 
--- | The per-batch processing budget: a shrinking item counter AND a wall-clock deadline.
--- Both bound how many NEW vision-bearing items one run takes on, and either being spent
--- stops the run and defers the rest through the 'frozen' path, leaving frames queued and the
--- event watermark held, for the next batch to pick up.
+-- | Which stage is spending, so the budget knows which instant applies.
+data Stage = Events | Samples
+  deriving stock (Eq, Show)
+
+-- | A batch's allowance, measured in time rather than in items.
+--
+-- Items are the wrong unit: a queued frame is one picture, an event is a snapshot plus up to
+-- 'eventClipFrames' more, so the same item count is anywhere from a minute of work to hours
+-- of it (see 'batchDeadlineSecs', which exists because the old item cap could not bound
+-- time). What actually needs bounding is how long the single batch worker is occupied, since
+-- every on-demand refresh and day rebuild queues behind it. So bound that directly.
 data Budget = Budget
-  { bgLeft     :: IORef Int
-  , bgDeadline :: UTCTime
-  , bgClock    :: Clock.Handle
+  { bgEventsUntil :: UTCTime
+  -- ^ Events may start a new item before this. Its only job is to protect the samples that
+  -- run after them: the stages are sequential, so events cannot themselves be starved, and
+  -- capping them here leaves the rest of the window for samples however long ingest wants.
+  , bgDeadline    :: UTCTime
+  -- ^ The whole batch's ceiling, and the samples' limit.
+  , bgSpent       :: IORef Int
+  -- ^ Items done, for the outcome note only. It does not gate anything.
+  , bgClock       :: Clock.Handle
   }
 
--- | Build a fresh batch budget: a full item counter and a deadline
--- 'batchDeadlineSecs' out from now.
+-- | Build a fresh batch allowance: the event cut of the window, then the window itself.
 newBudget :: App -> IO Budget
 newBudget app = do
-  ref <- newIORef batchItemCap
   now <- Clock.now (appClock app)
-  pure (Budget ref (addUTCTime batchDeadlineSecs now) (appClock app))
+  spent <- newIORef 0
+  pure
+    Budget
+      { bgEventsUntil = addUTCTime (fromRational (eventWindowShare * toRational batchDeadlineSecs)) now
+      , bgDeadline = addUTCTime batchDeadlineSecs now
+      , bgSpent = spent
+      , bgClock = appClock app
+      }
 
--- | How many item units the budget has spent, for the outcome note.
+-- | The events' cut of the batch window. The remainder is what samples are guaranteed, so
+-- this is really "how much of the window ingest may take before the fallback gets its turn".
+-- A dimensionless fraction, not a duration, hence 'Rational' rather than the
+-- 'NominalDiffTime' it is multiplied by.
+eventWindowShare :: Rational
+eventWindowShare = 7 / 10
+
+-- | How many items the batch got through, for the outcome note.
 budgetUsed :: Budget -> IO Int
-budgetUsed b = (batchItemCap -) <$> readIORef (bgLeft b)
+budgetUsed = readIORef . bgSpent
 
--- | Take one unit of the per-batch budget. 'False' once EITHER the item counter is spent OR
--- the wall-clock deadline has passed. Checked before each item, so a large backlog is
--- deferred rather than read into memory.
-takeBudget :: Budget -> IO Bool
-takeBudget b = do
+-- | May this stage start another item? 'False' once its instant has passed. Checked before
+-- each item, so a large backlog is deferred rather than read into memory.
+--
+-- One item can overshoot its limit, since the check happens before the work rather than
+-- during it. That is bounded by a single item's duration and is the same behaviour the
+-- deadline has always had.
+--
+-- Time also spills the right way for free. Ingest finishing early leaves the rest of the
+-- window to samples, because samples measure against the outer deadline and never against
+-- what events did or did not use.
+takeBudget :: Stage -> Budget -> IO Bool
+takeBudget stage b = do
   now <- Clock.now (bgClock b)
-  if now >= bgDeadline b
+  if now >= limit
     then pure False
-    else atomicModifyIORef' (bgLeft b) (\n -> if n > 0 then (n - 1, True) else (n, False))
+    else do
+      atomicModifyIORef' (bgSpent b) (\n -> (n + 1, ()))
+      pure True
+  where
+    limit = case stage of
+      Events  -> bgEventsUntil b
+      Samples -> bgDeadline b
 
 -- | The pipeline's component tracer.
 ptrace :: App -> Tracer IO PipelineEvent
@@ -208,9 +266,17 @@ capture app = do
   -- rather than cfgCameras. applyProfile falls back to the env camera list when the profile
   -- enables none, which would queue frames the drain never reads.
   prof <- Db.getProfile (appDb app)
-  cams <- Frigate.onlineCameras (appFrigate app) (enabledCameras prof)
+  online <- Frigate.onlineCameras (appFrigate app) (enabledCameras prof)
   now <- Clock.now (appClock app)
-  let ts = round (utcTimeToPOSIXSeconds now) :: Integer
+  -- A sample exists to cover a stretch Frigate said nothing about, so a camera Frigate has
+  -- just reported on does not need one: the event carries a clip and a real detection, which
+  -- a blind snapshot of the same room does not. Skipping those keeps the queue to genuinely
+  -- quiet cameras instead of a fixed frame-per-camera-per-interval that no batch can drain.
+  -- No online camera means nothing to sample either way, so skip the quiet check rather than
+  -- spending a Frigate request every pass to learn that.
+  busy <- if null online then pure Set.empty else busyCameras app (posixSecs now)
+  let cams = filter (`Set.notMember` busy) online
+      ts = round (utcTimeToPOSIXSeconds now) :: Integer
   -- One independent Frigate fetch and queue-write per camera. They are network-bound and
   -- write to distinct directories, so run them together rather than one after another.
   saved <- sum
@@ -224,6 +290,28 @@ capture app = do
       cams
   traceWith (ptrace app) (FramesQueued saved (length cams))
 
+-- | The cameras Frigate has reported an event on within 'captureQuietSecs', which therefore
+-- need no blind sample this pass.
+--
+-- One request covering every camera, grouped here, rather than one per camera: 'capture'
+-- already fans out per camera for the frame fetch, and this would multiply that.
+--
+-- A failed fetch reads as "nobody is busy", so a Frigate blip degrades to sampling everything
+-- (the old behaviour) rather than to sampling nothing. Silence is the wrong default when the
+-- whole point of a sample is to cover a gap. 'eventFetchLimit' is reused as the page size
+-- here; only the distinct camera set matters, so a truncated page can at worst leave a busy
+-- camera looking quiet and earn it one redundant frame.
+busyCameras :: App -> Double -> IO (Set.Set Text)
+busyCameras app nowP = do
+  mevents <-
+    Frigate.recentEvents
+      (appFrigate app)
+      (ingestLabels (appConfig app))
+      (nowP - captureQuietSecs)
+      nowP
+      eventFetchLimit
+  pure (maybe Set.empty (Set.fromList . map feCamera) mevents)
+
 -- --------------------------------------------------------------------------- --
 -- Batch
 -- --------------------------------------------------------------------------- --
@@ -232,8 +320,11 @@ capture app = do
 -- running alongside an on-demand rebuild or an inline cleanup-now.
 batch :: App -> IO ()
 batch app = withBatchLock app $ do
+  -- The profile is read here rather than inside 'batchSteps' because the budget is sized
+  -- from the enabled camera count, so it has to exist before the budget does.
+  prof <- Db.getProfile (appDb app)
   budget <- newBudget app
-  recordingOutcome app (batchNote budget) (batchSteps app budget)
+  recordingOutcome app (batchNote budget) (batchSteps app budget prof)
   where
     batchNote budget secs = do
       used <- budgetUsed budget
@@ -249,7 +340,8 @@ batch app = withBatchLock app $ do
 buildDay :: App -> Day -> IO ()
 buildDay app day = withBatchLock app $ do
   -- buildDay shares the batch budget mechanism, so a heavy past-day rebuild is
-  -- deadline-bounded too and defers its remainder instead of running unbounded.
+  -- deadline-bounded too and defers its remainder instead of running unbounded. It only
+  -- ingests events, never the frame queue, so the samples' part of the window goes unused.
   budget <- newBudget app
   recordingOutcome app (\secs -> pure ("built " <> tshow day <> " in " <> tshow secs <> "s")) $ do
     prof <- Db.getProfile (appDb app)
@@ -321,12 +413,22 @@ recordingOutcome app mkNote act = do
     Right () -> mkNote secs >>= recordBatch app done RanOk
     Left e   -> recordBatch app done RanError (T.take 200 (tshow e)) >> throwIO e
 
-batchSteps :: App -> Budget -> IO ()
-batchSteps app budget = do
-  prof <- Db.getProfile (appDb app)
+batchSteps :: App -> Budget -> Profile -> IO ()
+batchSteps app budget prof = do
   refreshBriefStep app prof
+  -- Events BEFORE queued samples, and the order is load-bearing rather than incidental.
+  -- Both draw on the one budget, so whichever runs first can spend all of it. Capture
+  -- queues a frame per camera per interval whether or not anything happened, which
+  -- outpaces what a batch can analyse, so draining the queue first starves ingest
+  -- permanently: the watermark freezes below the first event and never moves again.
+  -- Samples exist to fill the gaps between events, so events are the signal and samples
+  -- take the remainder.
+  late <- ingestEvents app budget prof
   analyzeQueue app budget prof
-  ingestEvents app budget prof
+  -- After BOTH stages, since a frame queued last night lands on yesterday exactly as an
+  -- event does. Repairing between them would rewrite yesterday's story and then bury it
+  -- under the samples that arrived a moment later.
+  repairLateDays app prof late
   pruneProof app prof
   pruneQueue app prof
   finishReport app prof
@@ -361,38 +463,44 @@ analyzeQueue :: App -> Budget -> Profile -> IO ()
 analyzeQueue app budget prof =
   handle onErr $ do
     brief <- IdentGuide.identGuide (appDb app) prof
-    forM_ (enabledCameras prof) (perCamera brief)
+    queues <- mapM pending (enabledCameras prof)
+    -- Round-robin rather than draining each camera in turn. Sequentially, a share that runs
+    -- out is spent entirely on whichever camera sorts first, and the last camera is never
+    -- analysed at all: the same starvation as events-versus-samples, one level down and
+    -- with a stable order, so the same camera loses every batch. Interleaving spreads a
+    -- short share evenly, oldest frame of each camera first.
+    forM_ (concat (transpose queues)) (analyseFrame brief)
   where
     cfg = appConfig app
     onErr (e :: SomeException) =
       traceWith (ptrace app) (ModelUnavailable (tshow e))
-    perCamera brief cam = do
-      let qdir = cfgQueueDir cfg </> T.unpack cam
-      files <- sort <$> listJpgs qdir
-      forM_ (mapMaybe withTs files) $ \(fname, ts) -> do
-        ok <- takeBudget budget
-        -- Over the per-batch item cap OR past the wall-clock deadline, leave the frame
-        -- queued for the next run. Checked before reading the file, so a large backlog is
-        -- not all pulled into memory. The frame count on disk already bounds this path;
-        -- the deadline mostly protects the unbounded event path.
-        if not ok
-          then pure ()
-          else do
-            let qpath = qdir </> fname
-            mjpg <- tryRead qpath
-            case mjpg of
-              Nothing -> pure ()
-              Just jpg -> do
-                mscene <- Vision.analyze (appLlm app) brief [jpg]
-                case mscene of
-                  -- Unparsed response, so leave the frame queued to retry. pruneQueue caps
-                  -- genuinely-stuck frames, so they cannot linger forever.
-                  Nothing -> pure ()
-                  Just scene
-                    | hasPet scene -> do
-                        moveToProof cfg cam fname
-                        Db.insertObservation (appDb app) (sampleObs ts cam scene)
-                    | otherwise -> removeQuiet qpath
+    pending cam = do
+      files <- sort <$> listJpgs (cfgQueueDir cfg </> T.unpack cam)
+      pure [(cam, f) | f <- mapMaybe withTs files]
+    analyseFrame brief (cam, (fname, ts)) = do
+      ok <- takeBudget Samples budget
+      -- Over the samples' share OR past the wall-clock deadline, leave the frame queued for
+      -- the next run. Checked before reading the file, so a large backlog is not all pulled
+      -- into memory.
+      if not ok
+        then pure ()
+        else do
+          let qdir = cfgQueueDir cfg </> T.unpack cam
+              qpath = qdir </> fname
+          mjpg <- tryRead qpath
+          case mjpg of
+            Nothing -> pure ()
+            Just jpg -> do
+              mscene <- Vision.analyze (appLlm app) brief [jpg]
+              case mscene of
+                -- Unparsed response, so leave the frame queued to retry. pruneQueue caps
+                -- genuinely-stuck frames, so they cannot linger forever.
+                Nothing -> pure ()
+                Just scene
+                  | hasPet scene -> do
+                      moveToProof cfg cam fname
+                      Db.insertObservation (appDb app) (sampleObs ts cam scene)
+                  | otherwise -> removeQuiet qpath
 
 sampleObs :: Integer -> Text -> Scene -> NewObservation
 sampleObs ts cam scene =
@@ -406,12 +514,95 @@ sampleObs ts cam scene =
 -- | The daily batch's event catch-up: advance the global watermark through the events since
 -- it, oldest-first, then persist it. A long absence catches up a page per pass, while a
 -- normal batch needs a single request.
-ingestEvents :: App -> Budget -> Profile -> IO ()
+--
+-- Returns the past days this pass could still add to, each with what it held beforehand, for
+-- 'repairLateDays' to compare against once the batch has finished storing. The pair is taken
+-- here because only this function knows the window: the watermark it starts from is clamped
+-- to Frigate's retention, so a caller sampling the stored value would name the wrong days.
+ingestEvents :: App -> Budget -> Profile -> IO [(Day, Int)]
 ingestEvents app budget prof = do
-  wm <- fmap (fromMaybe 0 . (>>= parseDouble)) (Db.getState (appDb app) "last_event_ts")
-  nowP <- posixSecs <$> Clock.now (appClock app)
+  stored <- Db.getIngestWatermark (appDb app)
+  now <- Clock.now (appClock app)
+  tz <- Clock.timeZone (appClock app)
+  let nowP = posixSecs now
+  wm <- clampToRetention app nowP stored
+  let stale = lateDayCandidates tz now wm
+  before <- traverse (countObsOn app tz now) stale
   newWm <- ingestWindowSafe app budget prof wm nowP
-  Db.setState (appDb app) "last_event_ts" (tshow newWm)
+  Db.setIngestWatermark (appDb app) newWm
+  pure (zip stale before)
+
+-- | Rewrite the story of any past day this batch actually added to.
+--
+-- 'finishReport' only ever writes today, so a day first reported while it was still
+-- half-finished keeps the narrative it was given: its timeline and its stats heal on their
+-- own as the missing moments land, its prose never does.
+--
+-- Counted rather than assumed, because the ingest window always reaches back into yesterday.
+-- Repairing every day it touched would re-narrate yesterday every single morning, at a model
+-- call each, to say the same thing again. Silent, too: the owner was told about that day when
+-- it was current, and a correction is not news.
+repairLateDays :: App -> Profile -> [(Day, Int)] -> IO ()
+repairLateDays app prof before = do
+  now <- Clock.now (appClock app)
+  tz <- Clock.timeZone (appClock app)
+  forM_ before $ \(day, was) -> do
+    is <- countObsOn app tz now day
+    when (is > was) (finishReportFor app prof day False)
+
+-- | The past days an ingest window starting at @wm@ can still add observations to, oldest
+-- first, today excluded.
+--
+-- Capped so a long backlog cannot turn one batch into a run of narrative calls. The rest are
+-- not lost: each batch takes the next few, so a ten-day gap heals over a few runs.
+lateDayCandidates :: TZ -> UTCTime -> Double -> [Day]
+lateDayCandidates tz now wm =
+  let from = localDayOf tz (posixSecondsToUTCTime (realToFrac wm))
+      today = localDayOf tz now
+   in take maxLateDayRepairs (takeWhile (< today) [addDays k from | k <- [0 ..]])
+
+-- | How many past days one batch will re-narrate.
+maxLateDayRepairs :: Int
+maxLateDayRepairs = 3
+
+countObsOn :: App -> TZ -> UTCTime -> Day -> IO Int
+countObsOn app tz now day =
+  let (dayStart, dayEnd) = localDayWindow tz now day
+   in length <$> Db.observationsBetween (appDb app) dayStart dayEnd
+
+-- | Floor the watermark at Frigate's own media-retention horizon.
+--
+-- Past that horizon the clips and snapshots are gone, so those events can only be fetched,
+-- found media-less and skipped, and each one still costs a budget unit on the way. A
+-- watermark left far behind (ingest wedged, or the service down for a fortnight) would
+-- otherwise spend batch after batch grinding through history that can no longer be analysed,
+-- while the events happening now wait behind it.
+--
+-- Retention comes from 'appRetention', which the poller keeps fresh and which a failed fetch
+-- leaves untouched rather than blanking. The MAXIMUM across cameras is the floor, not the
+-- minimum, so an event still recoverable from the longest-retaining camera is not discarded
+-- for the sake of the shortest. An empty map means retention is simply unknown, in which
+-- case guessing a floor could silently discard real history, so nothing is clamped.
+-- 'Nothing' is a watermark that has never been set, which is a fresh install rather than a
+-- stall. Kept as a 'Maybe' rather than collapsed to 0, so "never ingested" and "ingested at
+-- the epoch" stay distinguishable and the warning below can tell them apart.
+clampToRetention :: App -> Double -> Maybe Double -> IO Double
+clampToRetention app nowP mwm = do
+  retain <- readTVarIO (appRetention app)
+  case Map.elems retain of
+    -- No floor can be justified, so honour what is stored. A fresh install then sweeps from
+    -- 0, which is slow but complete, and the next pass has retention to clamp with.
+    [] -> pure (fromMaybe 0 mwm)
+    days
+      | Just wm <- mwm, wm >= horizon -> pure wm
+      | otherwise -> do
+          -- Only an actual stall is worth warning about. A fresh install has no watermark,
+          -- and starting at the horizon is simply where it should start.
+          forM_ mwm $ \wm ->
+            traceWith (ptrace app) (IngestWatermarkStale (round ((nowP - wm) / 86400)))
+          pure horizon
+      where
+        horizon = nowP - maximum days * 86400
 
 -- | 'ingestWindow' made resilient. A Frigate or model hiccup mid-pass aborts and is traced
 -- rather than propagated, so a batch or a past-day rebuild still finishes its report, and
@@ -437,14 +628,16 @@ ingestWindow :: App -> Budget -> Profile -> Double -> Double -> IO Double
 ingestWindow app budget prof lo hi
   | hi <= lo = pure lo
   | otherwise = do
-      let cfg = appConfig app
-          labels = cfgPetLabels cfg ++ cfgAudioLabels cfg
-      mevents <- Frigate.recentEvents (appFrigate app) labels lo hi eventFetchLimit
+      mevents <- Frigate.recentEvents (appFrigate app) (ingestLabels (appConfig app)) lo hi eventFetchLimit
       case mevents of
         -- A failed fetch, NOT an empty window. Hold the watermark so this range is retried
         -- next pass, rather than advancing past events we never saw.
         Nothing -> pure lo
         Just events -> do
+          -- Log the window's yield before folding, so the per-event skip traces below have a
+          -- denominator: an empty window (0 returned) reads differently from a full one whose
+          -- events were every one skipped.
+          traceWith (ptrace app) (EventsFetched (length events) (round lo) (round hi))
           nowP <- posixSecs <$> Clock.now (appClock app)
           -- The brief does not change across the pass, so fetch it once rather than per
           -- event.
@@ -458,7 +651,13 @@ ingestWindow app budget prof lo hi
           -- Events arrive oldest-first, so the fold's max is the newest one processed, and
           -- 'advanceWatermark' decides where the cursor lands.
           (_, wm, frozen) <- foldM (step nowP brief) (seed, lo, False) events
-          pure (advanceWatermark lo frozen (length events) wm hi)
+          let newWm = advanceWatermark lo frozen (length events) wm hi
+          -- Events came back but the watermark moved past none of them, so the next pass
+          -- re-fetches this exact window. Once is ordinary (a budget ran out, media was not
+          -- ready). Every pass means ingest is wedged and nothing will ever be recorded.
+          when (not (null events) && newWm <= lo) $
+            traceWith (ptrace app) (IngestStalled (length events))
+          pure newWm
   where
     -- Fold over events in start order. The watermark advances past anything already
     -- stored, freshly stored, or deliberately cooldown-skipped, but freezes below the first
@@ -473,7 +672,8 @@ ingestWindow app budget prof lo hi
       FrigateEvent ->
       IO (Map (Text, Text) Double, Double, Bool)
     step nowP brief (seen, wm, frozen) ev
-      | feFalsePositive ev =
+      | feFalsePositive ev = do
+          traceWith (ptrace app) (EventSkipped SkippedFalsePositive (feId ev) (feLabel ev))
           -- A Frigate-confirmed non-detection. Advance past it, but leave the cooldown map
           -- alone, since it is not a real sighting, and spend no budget or vision on it.
           pure (seen, adv wm, frozen)
@@ -484,7 +684,9 @@ ingestWindow app budget prof lo hi
             -- hold. Advance past it for free: no snapshot, no vision, no budget.
             then pure (Map.insert key (feStart ev) seen, adv wm, frozen)
             else if not coolOk
-              then pure (seen, adv wm, frozen)
+              then do
+                traceWith (ptrace app) (EventSkipped SkippedCooldown (feId ev) (feLabel ev))
+                pure (seen, adv wm, frozen)
               else do
                 -- Only events past cooldown do real work, so only they take budget. Over
                 -- the item cap OR past the wall-clock deadline, freeze the watermark so
@@ -492,7 +694,7 @@ ingestWindow app budget prof lo hi
                 -- unbounded. A deadline stop and a budget stop are the same thing here:
                 -- both defer the remainder through the frozen watermark, leaving the events
                 -- in Frigate to re-fetch.
-                ok <- takeBudget budget
+                ok <- takeBudget Events budget
                 if not ok
                   then pure (seen, wm, True)
                   else do
@@ -501,7 +703,9 @@ ingestWindow app budget prof lo hi
                       then pure (Map.insert key (feStart ev) seen, adv wm, frozen)
                       else
                         if nowP - feStart ev > eventRetryWindowSec
-                          then pure (seen, adv wm, frozen)
+                          then do
+                            traceWith (ptrace app) (EventSkipped SkippedAbandoned (feId ev) (feLabel ev))
+                            pure (seen, adv wm, frozen)
                           else pure (seen, wm, True)
       where
         key = (feCamera ev, feLabel ev)
@@ -525,7 +729,9 @@ ingestOne app brief ev
       -- retry window. A still-open event may yet get its media, so hold the watermark below
       -- it and retry, exactly as a not-ready snapshot does.
       Frigate.NoMedia
-        | isJust (feEnd ev) -> pure True
+        | isJust (feEnd ev) -> do
+            traceWith (ptrace app) (EventSkipped SkippedNoMedia (feId ev) (feLabel ev))
+            pure True
         | otherwise         -> pure False
       media -> do
         msnap <- Frigate.eventSnapshot (appFrigate app) (feId ev)
@@ -768,9 +974,6 @@ concerningObs obs = case perception obs of
     bad ap =
       let b = behaviors ap
        in not (null (concerns b)) || accidentSuspected b || injurySuspected b
-
-parseDouble :: Text -> Maybe Double
-parseDouble = readMaybe . T.unpack
 
 -- | A UTC time as fractional POSIX seconds, the unit the event watermark and Frigate's
 -- @after@/@before@ bounds use.
