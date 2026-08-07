@@ -60,12 +60,15 @@ pets stay on your network.
                         vision model
 ```
 
-1. Frigate watches your cameras and flags pets and sounds.
+1. Frigate watches your cameras and flags pets, people and sounds.
 2. Twice a day, pet-report works through the new flags. It sends each frame (and
    its clip) to the vision model, stores what comes back as structured per-pet
-   observations, writes the day's summary, and updates the stats.
-3. Between Frigate's events it also grabs a frame from each camera every few
-   minutes, so quiet stretches aren't left blank.
+   observations, writes the day's summary, and updates the stats. People are
+   recorded too, so a sitter's visit shows up, but a person is never counted as
+   a pet.
+3. On a camera Frigate has been quiet about for an hour, it also grabs a frame
+   every few minutes, so a long nap doesn't leave the day blank. A camera Frigate
+   has just reported on is skipped, since that event already carries a clip.
 4. The web app shows the day, the pets, and the moments.
 
 ## What you get
@@ -166,10 +169,10 @@ The flake exposes `nixosModules.pet-report` and `overlays.default`:
 ```
 
 The module runs the single `serve` service, builds the frontend, and configures
-nginx to serve it and proxy `/api` and `/proof` to the backend. It captures
-frames every 10 minutes and batches at 08:00 and 20:00 from background loops of
-that one process (tune with `PET_REPORT_CAPTURE_SECS` and
-`PET_REPORT_BATCH_HOURS`). First visit opens the guided setup: name your pets,
+nginx to serve it and proxy `/api` and `/proof` to the backend. It checks in on
+quiet cameras every 10 minutes and batches at 08:00 and 20:00 from background
+loops of that one process (tune with `PET_REPORT_CAPTURE_SECS`, or in Settings,
+and `PET_REPORT_BATCH_HOURS`). First visit opens the guided setup: name your pets,
 describe how to tell them apart (or attach a photo and let it draft the
 description), pick cameras auto-discovered from Frigate, and test the
 connections.
@@ -290,19 +293,20 @@ list.
 | `PET_REPORT_PUBLIC_URL` | (unset) | public web UI URL; the tap-through target for push notifications |
 | `PET_CAMERAS` | `office` | fallback camera list (the profile supersedes it) |
 | `PET_LABELS` | `dog,cat` | Frigate object labels ingested as pet sightings |
+| `PET_REPORT_PERSON_LABELS` | `person` | Frigate object labels ingested as people, not pets; empty to ignore people |
 | `PET_AUDIO_LABELS` | `bark,meow,doorbell,…` | Frigate audio labels ingested as sound events |
 | `PET_REPORT_DB` | XDG data dir | SQLite database path |
 | `PET_REPORT_QUEUE` | XDG data dir `/queue` | periodic-frame queue directory |
 | `PET_REPORT_PROOF_DIR` | XDG data dir `/proof` | retained proof-frame directory |
 | `PET_REPORT_MEDIA_DIR` | XDG data dir `/media` | owned copies of kept moments' media and pet photos |
 | `PET_REPORT_RETENTION_POLL_SECS` | `900` | how often to re-read Frigate's clip retention for the countdown |
-| `PET_REPORT_CAPTURE_SECS` | `600` | how often the capture loop queues a frame per online camera |
+| `PET_REPORT_CAPTURE_SECS` | `600` | how often to check in on a camera Frigate has been quiet about (also settable in-app) |
 | `PET_REPORT_BATCH_HOURS` | `8,20` | local hours the batch (analysis, report, cleanup) runs |
 | `PET_REPORT_LOG_LEVEL` | `info` | minimum severity logged: `debug`, `info`, `warn`, `error` |
 
-The Frigate/model URLs, model name, timezone, enabled cameras, and the
-keep-moments window are all editable in-app. A saved profile overrides the
-matching env default with no restart.
+The Frigate/model URLs, model name, timezone, enabled cameras, the keep-moments
+window, and the check-in interval are all editable in-app. A saved profile
+overrides the matching env default with no restart.
 
 Everything else in the table is environment-only and read once at startup.
 

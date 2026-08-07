@@ -1,7 +1,44 @@
 # Changelog
 
-Notable changes to pet-report. The format follows
-[Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
+Notable changes to pet-report, newest first.
+
+## Unreleased
+
+### Breaking changes
+
+- Ingest resumes from Frigate's retention horizon on the first batch after
+  upgrading. Anything older is never picked up, its clips having expired already.
+
+### New features
+
+- Frigate `person` events are ingested, so a sitter or a visitor shows up in the
+  day. A person never counts towards a pet's meals or rest. Set
+  `PET_REPORT_PERSON_LABELS` empty to turn it off.
+- A "still catching up" notice on a day whose events have not all been looked at.
+  Tap it to catch up.
+- The check-in interval is settable in Settings, with no restart.
+
+### Minor changes
+
+- A batch is bounded by time, not by a count of jobs. Ingest gets the first 70% of
+  the window, frame analysis the rest. A batch that is catching up now runs the
+  full twenty minutes.
+- Check-in frames are only taken for a camera Frigate has been quiet about for an
+  hour. Expect far fewer near-identical moments overnight.
+- A flagged pet says why ("no meals seen today", "a concern this week") instead of
+  "needs a peek".
+- Ingest logging: what each pass fetched, and why any event was dropped.
+
+### Bug fixes
+
+- Frigate events were never ingested. Check-in frames took the whole batch budget
+  and froze the event watermark. Every install was affected.
+- Queued frames are analysed round-robin across cameras. The last camera used to
+  be starved by whichever camera sorted first.
+- A day's story is rewritten when its moments arrive late. Only its timeline and
+  stats used to heal.
+- The wellbeing line no longer claims a moment is flagged when the flag came from
+  a missed meal.
 
 ## 0.1.0 - 2026-07-29
 
