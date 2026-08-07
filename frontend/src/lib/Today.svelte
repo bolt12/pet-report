@@ -98,10 +98,15 @@
       .catch(() => {})
   })
 
-  // Poll a day's batch flag until its run finishes, with a safety cap (~3 min) so a
-  // hung run can never wedge the spinner; stops early if the view is unmounted.
+  // Poll a day's batch flag until its run finishes, with a safety cap so a hung run can
+  // never wedge the spinner; stops early if the view is unmounted.
+  //
+  // The cap has to sit above the server's own batch deadline (20 minutes), or it fires on
+  // runs that are merely long: the spinner clears while the run is still working, and the
+  // outcome read afterwards is the PREVIOUS run's record, since this one has not written
+  // its own yet.
   async function pollUntilIdle(arg?: string) {
-    const deadline = Date.now() + 3 * 60 * 1000
+    const deadline = Date.now() + 25 * 60 * 1000
     while (alive && Date.now() < deadline) {
       await new Promise((r) => setTimeout(r, 2000))
       if (!alive) return
@@ -322,7 +327,7 @@
         <div class="mt-[1px] text-[12px]" style="color:var(--muted)">
           {refreshing
             ? 'Working through the rest now'
-            : "Some of this day's moments haven't been looked at yet, so the story may be incomplete. Tap to catch up."}
+            : "This day still has camera events to look at, so its story may be incomplete. Tap to work through them; a busy day can take more than one go."}
         </div>
       </div>
       <span class="flex-shrink-0 text-[19px]" style="color:var(--faint)">›</span>

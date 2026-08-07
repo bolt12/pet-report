@@ -15,7 +15,7 @@ Notable changes to pet-report, newest first.
   day. A person never counts towards a pet's meals or rest. Set
   `PET_REPORT_PERSON_LABELS` empty to turn it off.
 - A "still catching up" notice on a day whose events have not all been looked at.
-  Tap it to catch up.
+  Tap it to work through them; a busy day can take more than one go.
 - The check-in interval is settable in Settings, with no restart.
 
 ### Minor changes
@@ -37,6 +37,11 @@ Notable changes to pet-report, newest first.
   be starved by whichever camera sorted first.
 - A day's story is rewritten when its moments arrive late. Only its timeline and
   stats used to heal.
+- Rebuilding a past day now finishes it: it works through the whole day rather
+  than one page of 500 events, uses the full window rather than the 70% reserved
+  for a frame queue it never touches, and clears the catch-up notice when done.
+- The refresh spinner gave up after three minutes, less than a batch may take, so
+  it cleared mid-run and reported the previous run's outcome.
 - The wellbeing line no longer claims a moment is flagged when the flag came from
   a missed meal.
 

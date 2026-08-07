@@ -142,26 +142,35 @@ batchH app mday = liftIO $ do
 
 -- | Whether every event of the day in question has been looked at yet.
 --
--- The test is the ingest watermark against the END of that day, never against "now". A
--- caught-up system's watermark is legitimately hours old between batches, so comparing with
--- now would report the app as behind twice a day, every day, and the notice would be noise
--- within a week.
+-- Two ways a day can be finished, and both have to count, because the button this notice
+-- offers takes the second route. A past day is rebuilt by 'Pipeline.buildDay', which sweeps
+-- that day's own window and leaves the global watermark alone, so rebuilding an old day
+-- cannot rewind steady-state ingest. Asking the watermark alone would therefore keep the
+-- notice up on a day the owner had just finished, no matter how often they pressed it.
 --
--- A day still in progress is caught up once the watermark reaches the present, which is what
--- comparing against @min dayEnd now@ gives. No watermark at all reads as caught up: a fresh
--- install has nothing outstanding, and saying otherwise on first run would be a lie the owner
--- cannot act on.
+-- The watermark test is against the END of that day, never against "now". A caught-up
+-- system's watermark is legitimately hours old between batches, so comparing with now would
+-- report the app as behind twice a day, every day, and the notice would be noise within a
+-- week. A day still in progress is caught up once the watermark reaches the present, which is
+-- what comparing against @min dayEnd now@ gives.
+--
+-- No watermark at all reads as caught up: a fresh install has nothing outstanding, and saying
+-- otherwise on first run would be a lie the owner cannot act on.
 caughtUpOn :: App -> TZ -> UTCTime -> Maybe Text -> IO Bool
 caughtUpOn app tz now mday = do
-  stored <- Db.getIngestWatermark (appDb app)
-  case stored of
-    Nothing -> pure True
-    Just secs -> do
-      -- Resolved exactly as 'resolveRefresh' resolves it, so the notice and the refresh
-      -- button can never disagree about which day they mean.
-      let day = case mday of
-            Just raw | recognizedArg raw -> resolveDay tz now raw
-            _                            -> localDayOf tz now
-          (_, dayEnd) = localDayWindow tz now day
-          wm = posixSecondsToUTCTime (realToFrac secs)
-      pure (wm >= min dayEnd now)
+  -- Resolved exactly as 'resolveRefresh' resolves it, so the notice and the refresh button
+  -- can never disagree about which day they mean.
+  let day = case mday of
+        Just raw | recognizedArg raw -> resolveDay tz now raw
+        _                            -> localDayOf tz now
+  swept <- Db.getDaySwept (appDb app) day
+  if swept
+    then pure True
+    else do
+      stored <- Db.getIngestWatermark (appDb app)
+      case stored of
+        Nothing -> pure True
+        Just secs -> do
+          let (_, dayEnd) = localDayWindow tz now day
+              wm = posixSecondsToUTCTime (realToFrac secs)
+          pure (wm >= min dayEnd now)

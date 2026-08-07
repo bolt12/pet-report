@@ -23,6 +23,8 @@ module PetReport.Effect.Db.Queries
   , setState
   , getIngestWatermark
   , setIngestWatermark
+  , getDaySwept
+  , setDaySwept
   , insertReport
   , reportExists
   , latestReport
@@ -63,12 +65,14 @@ import           Data.Either                    (partitionEithers)
 import           Data.Int                       (Int64)
 import           Data.Map.Strict                (Map)
 import qualified Data.Map.Strict                as Map
-import           Data.Maybe                     (fromMaybe, listToMaybe)
+import           Data.Maybe                     (fromMaybe, isJust,
+                                                 listToMaybe)
 import           Data.Text                      (Text)
 import qualified Data.Text                      as T
 import           Data.Text.Encoding             (encodeUtf8)
 import qualified Data.Text.Lazy                 as TL
 import           Data.Time                      (Day, UTCTime, getCurrentTime)
+import           Data.Time.Calendar             (showGregorian)
 import           Database.SQLite.Simple         (Connection, Only (..),
                                                  Query (..), changes, execute,
                                                  execute_, fromOnly,
@@ -602,6 +606,21 @@ setIngestWatermark h = setState h ingestWatermarkKey . T.pack . show
 
 ingestWatermarkKey :: Text
 ingestWatermarkKey = "last_event_ts"
+
+-- | Whether a past day's own event window has been swept to its end.
+--
+-- A day rebuild sweeps that one day straight from Frigate and deliberately leaves the global
+-- watermark alone, so rebuilding an old day cannot rewind steady-state ingest. That makes the
+-- watermark the wrong thing to ask "is this day finished": it can sit weeks behind a day that
+-- is in fact complete. This is the per-day answer, set once a rebuild drains the day.
+getDaySwept :: Handle -> Day -> IO Bool
+getDaySwept h day = isJust <$> getState h (daySweptKey day)
+
+setDaySwept :: Handle -> Day -> IO ()
+setDaySwept h day = setState h (daySweptKey day) "1"
+
+daySweptKey :: Day -> Text
+daySweptKey day = "day_swept_" <> T.pack (showGregorian day)
 
 -- | Store the report for its (day, period), refreshing the narrative in place if one
 -- already exists. The unique index makes this an upsert rather than a duplicate row.

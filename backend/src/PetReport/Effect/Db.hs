@@ -34,6 +34,8 @@ module PetReport.Effect.Db
   , setState
   , getIngestWatermark
   , setIngestWatermark
+  , getDaySwept
+  , setDaySwept
   , insertReport
   , reportExists
   , latestReport
@@ -95,6 +97,7 @@ import           PetReport.Effect.Db.Queries    (Keepsake (..), PetSummary (..),
                                                  getObservation,
                                                  getObservationsByIds,
                                                  getPetSummary,
+                                                 getDaySwept,
                                                  getIngestWatermark,
                                                  getProfile, getState,
                                                  insertKeepsake,
@@ -114,6 +117,7 @@ import           PetReport.Effect.Db.Queries    (Keepsake (..), PetSummary (..),
                                                  recentEventStarts,
                                                  reportExists, reprojectAll,
                                                  revertObservation, schemaVersion,
+                                                 setDaySwept,
                                                  setIngestWatermark,
                                                  setState, setTranscript,
                                                  subjectStatsBetween, transcriptsFor,

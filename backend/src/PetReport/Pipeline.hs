@@ -202,12 +202,23 @@ data Budget = Budget
 
 -- | Build a fresh batch allowance: the event cut of the window, then the window itself.
 newBudget :: App -> IO Budget
-newBudget app = do
+newBudget = budgetWith eventWindowShare
+
+-- | An allowance for a run with no sample stage, so events get the whole window.
+--
+-- The event cut exists only to leave room for the samples that follow. A past-day rebuild
+-- never touches the frame queue, so applying it there would idle the last 30% of the window
+-- for nobody, and stop a rebuild that had real work left with minutes still on the clock.
+newEventBudget :: App -> IO Budget
+newEventBudget = budgetWith 1
+
+budgetWith :: Rational -> App -> IO Budget
+budgetWith share app = do
   now <- Clock.now (appClock app)
   spent <- newIORef 0
   pure
     Budget
-      { bgEventsUntil = addUTCTime (fromRational (eventWindowShare * toRational batchDeadlineSecs)) now
+      { bgEventsUntil = addUTCTime (fromRational (share * toRational batchDeadlineSecs)) now
       , bgDeadline = addUTCTime batchDeadlineSecs now
       , bgSpent = spent
       , bgClock = appClock app
@@ -340,9 +351,8 @@ batch app = withBatchLock app $ do
 buildDay :: App -> Day -> IO ()
 buildDay app day = withBatchLock app $ do
   -- buildDay shares the batch budget mechanism, so a heavy past-day rebuild is
-  -- deadline-bounded too and defers its remainder instead of running unbounded. It only
-  -- ingests events, never the frame queue, so the samples' part of the window goes unused.
-  budget <- newBudget app
+  -- deadline-bounded too and defers its remainder instead of running unbounded.
+  budget <- newEventBudget app
   recordingOutcome app (\secs -> pure ("built " <> tshow day <> " in " <> tshow secs <> "s")) $ do
     prof <- Db.getProfile (appDb app)
     tz <- Clock.timeZone (appClock app)
@@ -357,8 +367,30 @@ buildDay app day = withBatchLock app $ do
         -- discarded and eventStored dedups the overlap.
         lo = posixSecs loT - cursorEpsilon
         hi = posixSecs hiT
-    _ <- ingestWindowSafe app budget prof lo hi
+    drained <- sweepWindow app budget prof lo hi
     finishReportFor app prof day False
+    -- Marked only once the day's own events are all in AND its story is written, so a
+    -- rebuild that stopped short, or whose narrative call failed, leaves the day open: the
+    -- notice still says so and a second press picks up where this one stopped.
+    when drained (Db.setDaySwept (appDb app) day)
+
+-- | Ingest @[lo, hi)@ to its end, a page at a time. 'True' if it drained.
+--
+-- 'ingestWindow' takes one page of 'eventFetchLimit' per call, which is right for the daily
+-- batch: its watermark persists, so the next batch resumes from it. A rebuild discards the
+-- watermark, so a single call would cap a day at one page however much of the window is
+-- left, and pressing again would re-read the same page forever.
+--
+-- Terminates on any of the three ways forward stops: reaching @hi@, spending the budget, or a
+-- fetch that failed. All three leave the returned watermark at or below where the page began.
+sweepWindow :: App -> Budget -> Profile -> Double -> Double -> IO Bool
+sweepWindow app budget prof lo hi = go lo
+  where
+    go from = do
+      to <- ingestWindowSafe app budget prof from hi
+      if to >= hi
+        then pure True
+        else if to <= from then pure False else go to
 
 -- | How a batch run ended, for the honest last-batch state the UI reads. The wire
 -- form is "ok", "error" or "skipped" (see 'runOutcomeText'), which is what @batchH@ stores

@@ -788,6 +788,81 @@ contractHandlerUnits =
         -- That same watermark is past the END of yesterday, so yesterday IS done, even
         -- though the watermark is many hours older than the clock.
         caughtUpFor (Just "2026-08-05") >>= (@?= Bool True)
+  , testCase "rebuilding a past day catches it up, though the watermark stays put" $
+      -- The notice offers a rebuild, and a rebuild sweeps that day's own window while
+      -- deliberately leaving the global watermark alone, so it cannot rewind steady-state
+      -- ingest. Judged on the watermark alone the notice would therefore never clear, however
+      -- many times the owner pressed it: the button would do real work and appear to do
+      -- nothing. A rebuild that could not finish must still leave the day open.
+      withFakeApp id $ \app0 -> do
+        Db.putProfile (appDb app0) catProfile
+        frigateUp <- newIORef False
+        let fixedNow = UTCTime (fromGregorian 2026 8 6) (12 * 3600)
+            yesterday = fromGregorian 2026 8 5
+            wmAt = posixSecs (UTCTime yesterday 0)
+            app =
+              app0
+                { appClock = Clock.Handle {Clock.now = pure fixedNow, Clock.timeZone = pure utcTZ}
+                , appFrigate =
+                    fakeFrigate
+                      { Frigate.recentEvents = \_ _ _ _ -> do
+                          up <- readIORef frigateUp
+                          pure (if up then Just [] else Nothing)
+                      }
+                }
+            caughtUpFor raw = do
+              r <- runHandler (Web.batchH app raw)
+              case r of
+                Left e  -> assertFailure ("batchH failed: " <> show e) >> pure Null
+                Right v -> pure (fromMaybe Null (KeyMap.lookup "caughtUp" (objOf v)))
+        -- The watermark sits at the start of yesterday, so yesterday is behind.
+        Db.setIngestWatermark (appDb app) wmAt
+        caughtUpFor (Just "2026-08-05") >>= (@?= Bool False)
+        -- Frigate would not answer, so this rebuild reached nothing and the day stays open.
+        Pipeline.buildDay app yesterday
+        caughtUpFor (Just "2026-08-05") >>= (@?= Bool False)
+        -- Now it answers, the rebuild reaches the day's end, and the notice clears.
+        modifyIORef' frigateUp (const True)
+        Pipeline.buildDay app yesterday
+        caughtUpFor (Just "2026-08-05") >>= (@?= Bool True)
+        -- All of which happened without touching the global watermark.
+        Db.getIngestWatermark (appDb app) >>= (@?= Just wmAt)
+  , testCase "a rebuild reaches the end of a day that holds more than one page of events" $
+      -- One fetch returns at most eventFetchLimit events, so a busy day needs several. The
+      -- daily batch can leave the rest to the next run because its watermark persists; a
+      -- rebuild discards the watermark, so stopping after one page would cap the day at 500
+      -- events forever and every later press would re-read the same page.
+      withFakeApp id $ \app0 -> do
+        Db.putProfile (appDb app0) catProfile
+        let fixedNow = UTCTime (fromGregorian 2026 8 6) (12 * 3600)
+            yesterday = fromGregorian 2026 8 5
+            -- Exactly one full page. False positives, so the fold advances past them without
+            -- a snapshot, a model call or a budget unit: this test is about paging, not work.
+            evs =
+              [ mkEvent
+                  { feId = T.pack ("fp-" <> show i)
+                  , feFalsePositive = True
+                  , feStart = posixSecs (UTCTime yesterday (fromIntegral i * 60))
+                  }
+              | i <- [1 .. 500 :: Int]
+              ]
+            app =
+              app0
+                { appClock = Clock.Handle {Clock.now = pure fixedNow, Clock.timeZone = pure utcTZ}
+                , appFrigate =
+                    fakeFrigate
+                      { Frigate.recentEvents = \_ lo _ lim ->
+                          pure (Just (take lim (filter ((> lo) . feStart) evs)))
+                      }
+                }
+            caughtUpFor raw = do
+              r <- runHandler (Web.batchH app raw)
+              case r of
+                Left e  -> assertFailure ("batchH failed: " <> show e) >> pure Null
+                Right v -> pure (fromMaybe Null (KeyMap.lookup "caughtUp" (objOf v)))
+        Db.setIngestWatermark (appDb app) (posixSecs (UTCTime yesterday 0))
+        Pipeline.buildDay app yesterday
+        caughtUpFor (Just "2026-08-05") >>= (@?= Bool True)
   , testCase "statusH JSON keys match the client contract (Status)" $
       -- Point the EffSettings at a refused port so the two probes fail instantly
       -- rather than waiting for the 5s timeout in Probe.reachable.
