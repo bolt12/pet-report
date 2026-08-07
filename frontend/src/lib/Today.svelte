@@ -40,6 +40,10 @@
   let dayKey = $derived(ymdForOffset(day.offset))
   let refreshing = $derived(refreshes.isRefreshing(dayKey))
   let refreshed = $derived(refreshes.updatedIso === dayKey)
+  // False when this day still has camera events the app has not worked through, so its
+  // moments and its story are both incomplete. Defaults to true so nothing flashes up
+  // before the first check answers.
+  let caughtUp = $state(true)
   let dismissed = $state(false)
   let recapText = $state('')
   let recapBusy = $state(false)
@@ -55,10 +59,17 @@
     try {
       // The day's moments and the per-pet glance for that day, fetched together.
       // A past day gets its glance from the dated endpoint so its cards reflect it.
-      const [d, g] = await Promise.all([api.day(iso), api.insights(day.offset === 0 ? undefined : iso)])
+      const [d, g, s] = await Promise.all([
+        api.day(iso),
+        api.insights(day.offset === 0 ? undefined : iso),
+        // Whether this day's events have all been looked at yet. A failure here must never
+        // break the day, so it degrades to hiding the notice.
+        api.refreshStatus(day.offset === 0 ? undefined : iso).catch(() => null),
+      ])
       if (!alive || day.iso !== iso) return
       data = d
       glance = g
+      caughtUp = s?.caughtUp ?? true
       if (day.offset === 0) {
         // Live cameras and the earliest-day bound only make sense for today.
         overview = await api.overview()
@@ -297,6 +308,28 @@
   {/if}
 {/snippet}
 
+{#snippet catchUpNotice()}
+  <!-- shown only while this day still has events waiting to be looked at -->
+  {#if !caughtUp}
+    <button
+      onclick={refresh}
+      disabled={refreshing}
+      class="tappable mb-[16px] flex w-full items-center gap-[12px] rounded-[20px] p-[14px_15px] text-left"
+      style="background:rgba(236,177,99,0.1);border:1px solid rgba(236,177,99,0.3);color:inherit">
+      <span class="flex h-[38px] w-[38px] flex-shrink-0 items-center justify-center rounded-xl" style="background:var(--watch);color:#3a2a10"><Paw size={20} /></span>
+      <div class="min-w-0 flex-1">
+        <div class="font-head text-[15.5px] font-semibold" style="color:var(--text)">Still catching up</div>
+        <div class="mt-[1px] text-[12px]" style="color:var(--muted)">
+          {refreshing
+            ? 'Working through the rest now'
+            : "Some of this day's moments haven't been looked at yet, so the story may be incomplete. Tap to catch up."}
+        </div>
+      </div>
+      <span class="flex-shrink-0 text-[19px]" style="color:var(--faint)">›</span>
+    </button>
+  {/if}
+{/snippet}
+
 {#snippet needsNudge()}
   <!-- needs a look nudge -->
   <button onclick={() => onnav('review', needsCount > 0 ? 'needs' : undefined)} class="tappable mb-[16px] flex w-full items-center gap-[12px] rounded-[20px] p-[14px_15px] text-left" style="background:{needsCount > 0 ? 'rgba(236,177,99,0.1)' : 'rgba(163,192,143,0.1)'};border:1px solid {needsCount > 0 ? 'rgba(236,177,99,0.3)' : 'rgba(163,192,143,0.28)'};color:inherit">
@@ -357,6 +390,9 @@
   <DayNav />
 
   {#if error}<p class="mb-3 text-[13px]" style="color:#e26d5c">{error}</p>{/if}
+
+  <!-- Above the story, in both layouts, because it is a caveat on the story itself. -->
+  {@render catchUpNotice()}
 
   {#if layout.isWide}
     <!-- desktop: a wide story column beside a narrower rail -->

@@ -44,6 +44,14 @@
   let emphasis = $state<Record<string, boolean>>(topicsToEmphasis(seed.report.topics))
   let cameras = $state(seed.cameras.map((c) => ({ ...c })))
   let gcWindowDays = $state(seed.gcWindowDays ?? 30)
+  // Shown in minutes because that is how you think about it; stored in seconds. Blank
+  // means "follow the server's PET_REPORT_CAPTURE_SECS", which is why this is nullable
+  // rather than defaulting to a number the frontend would be guessing at.
+  let captureMins = $state<number | null>(seed.captureSecs ? Math.round(seed.captureSecs / 60) : null)
+  // One minute is the floor the capture loop enforces, so clamp here too rather than
+  // saving a value the scheduler would quietly ignore.
+  const captureSecsValue = () =>
+    captureMins == null || !Number.isFinite(captureMins) ? null : Math.max(60, Math.round(captureMins) * 60)
   // The whole-number, >= 1 value actually stored, so dirty-tracking, the save payload,
   // and (after save) the field itself all agree even if the input holds a blank or a
   // fractional number.
@@ -139,6 +147,7 @@
       topics: [...emphasisToTopics(emphasis)].sort(),
       cameras: cameras.map((c) => ({ camId: c.camId, room: c.room.trim(), enabled: c.enabled })),
       gcWindowDays: gcDays(),
+      captureSecs: captureSecsValue(),
     })
   let savedSnap = $state(snapshot())
   let dirty = $derived(snapshot() !== savedSnap)
@@ -181,6 +190,7 @@
       visionModel: visionModel.trim() || null,
       timeZone: timeZone.trim() || null,
       gcWindowDays: gcDays(),
+      captureSecs: captureSecsValue(),
     }
     try {
       const p = await api.saveSettings(updated)
@@ -319,6 +329,29 @@
     {:else}
       <input bind:value={timeZone} placeholder={deviceZone || 'e.g. Europe/Lisbon'} class="w-full rounded-[12px] border px-[12px] py-[10px] font-mono text-[12.5px] outline-none" style="background:var(--bg);border-color:var(--line);color:var(--text)" />
     {/if}
+  </div>
+
+  <!-- checking in on a quiet camera -->
+  <div class="mx-[2px] mb-[9px] text-[11px] font-extrabold tracking-wide uppercase" style="color:var(--faint)">Checking in on a quiet camera</div>
+  <div class="mb-[20px] rounded-[18px] border p-[15px]" style="background:var(--surface);border-color:var(--line)">
+    <div class="mb-[12px] text-[13.5px] leading-[2.1]" style="color:var(--text)">
+      When a camera has seen nothing for a while, take a look every
+      <input
+        type="number"
+        min="1"
+        bind:value={captureMins}
+        placeholder="10"
+        class="mx-[2px] w-[62px] rounded-[10px] border px-[10px] py-[6px] text-[13.5px] outline-none"
+        style="background:var(--bg);border-color:var(--line);color:var(--text)" />
+      minutes.
+    </div>
+    <div class="text-[11.5px] leading-[1.55]" style="color:var(--muted)">
+      These check-ins only happen on cameras your NVR has been quiet about for the past
+      hour. When it does spot something, that moment comes with its own clip, so no
+      check-in is needed. Longer means fewer near-identical moments to page through and
+      less work per batch; shorter means a sleepy afternoon is less likely to go
+      unrecorded. Leave it blank to use the server's setting.
+    </div>
   </div>
 
   <!-- keeping moments -->

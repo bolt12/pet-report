@@ -46,6 +46,9 @@ export interface Profile {
   // Honored literally at a one-day minimum, so shortening it actually takes effect.
   // Default 30.
   gcWindowDays: number
+  // Seconds between capture passes, overriding PET_REPORT_CAPTURE_SECS when set. Null
+  // falls back to that env value.
+  captureSecs: number | null
   configuredAt: string | null
 }
 
@@ -312,6 +315,10 @@ export interface BatchOutcome {
 export interface BatchStatus {
   running: boolean
   last: BatchOutcome | null
+  // False when the app has not worked through all of that day's camera events yet, so the
+  // day's moments and story are still incomplete. Compared against the day's end, not the
+  // clock, so a caught-up app does not report itself behind between batches.
+  caughtUp: boolean
 }
 
 // A flat, all-optional owner field edit of one moment (the id is in the path).
