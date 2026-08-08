@@ -39,7 +39,6 @@ import           Control.Monad.IO.Class   (liftIO)
 import           Data.Aeson               (Value, encode, object, (.=))
 import           Data.ByteString          (ByteString)
 import           Data.Int                 (Int64)
-import           Data.Maybe               (fromMaybe)
 import           Data.String              (fromString)
 import           Data.Text                (Text)
 import qualified Data.Text                as T
@@ -223,8 +222,8 @@ server app =
   :<|> proofH app
 
 
--- | The overview: enabled cameras with live online status, the needs-a-look badge count,
--- and the earliest logged day. Reads the profile fresh rather than the startup-baked config,
+-- | The overview: enabled cameras with live online status and the earliest logged day.
+-- Reads the profile fresh rather than the startup-baked config,
 -- so cameras added in setup appear immediately in the long-lived @serve@ process.
 overviewH :: App -> Handler Value
 overviewH app = liftIO $ do
@@ -235,11 +234,6 @@ overviewH app = liftIO $ do
   -- The earliest logged local day, so the client stops the day navigator at the first day
   -- with data instead of a fixed cap. Omitted when there is none.
   mRange <- Db.tsRange (appDb app)
-  -- The global needs-a-look backlog size for the badge, off the browse count path with
-  -- the needs-look facet over a zero-size page.
-  pending <-
-    fromMaybe 0 . Db.bpTotal
-      <$> Db.browseMoments (appDb app) (Db.emptyBrowseQuery {Db.bqReview = Just Db.NeedsLook, Db.bqLimit = 0})
   let earliest = case mRange of
         Just (lo, _) -> ["earliestDay" .= T.pack (show (localDayOf tz lo))]
         Nothing      -> []
@@ -249,7 +243,7 @@ overviewH app = liftIO $ do
           , "room" .= roomOf (cameras prof) (Camera c)
           , "online" .= (c `elem` online)
           ]
-  pure (object (["cameras" .= map one cams, "pendingReview" .= pending] ++ earliest))
+  pure (object (("cameras" .= map one cams) : earliest))
 
 -- --------------------------------------------------------------------------- --
 -- Helpers + runner

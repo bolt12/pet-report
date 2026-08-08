@@ -44,14 +44,11 @@
   let search = $state('')
   let filterOpen = $state(false)
 
-  // Range mode (from/to) vs day mode (following the shared day store).
-  // A needs-a-look nudge (no explicit range) opens the GLOBAL backlog over all retained
-  // days (contract D1), matching the Today badge; a deep-link with from/to pins that range.
-  const initRange = p0.from && p0.to
-    ? { from: p0.from, to: p0.to }
-    : p0.needs
-      ? { from: ymdForOffset(day.earliestOffset), to: ymdForOffset(0) }
-      : null
+  // Range mode (from/to) vs day mode (following the shared day store). A deep-link with
+  // from/to pins that range; everything else, a needs-a-look nudge included, follows the
+  // shared day, so the nudge opens the day it was tapped on rather than a global backlog.
+  // The full backlog is still reachable here by pairing the needs-look facet with a range.
+  const initRange = p0.from && p0.to ? { from: p0.from, to: p0.to } : null
   let range = $state<{ from: string; to: string } | null>(initRange)
   let fromDate = $state(initRange?.from ?? '')
   let toDate = $state(initRange?.to ?? '')

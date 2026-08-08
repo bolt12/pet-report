@@ -33,6 +33,10 @@ Notable changes to pet-report, newest first.
 
 ### Bug fixes
 
+- The Today "moments to review" badge counts only that day now, like every other day. It
+  showed the global needs-a-look backlog, so a single old uncertain moment made today read
+  as having one to review, and tapping opened that months-old moment. The whole backlog is
+  still reachable in Review by pairing the needs-look filter with a date range.
 - Frigate events were never ingested. Check-in frames took the whole batch budget
   and froze the event watermark. Every install was affected.
 - Queued frames are analysed round-robin across cameras. The last camera used to

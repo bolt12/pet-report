@@ -167,11 +167,10 @@
   let alert = $derived(day.offset === 0 && !dismissed ? obs.find((o) => o.wellbeing === 'concerning') : undefined)
   let concerningCount = $derived(obs.filter((o) => o.wellbeing === 'concerning').length)
   let live = $derived(overview?.cameras ?? [])
-  // On today the badge shows the GLOBAL needs-a-look backlog (contract D1); a past day
-  // shows its own day-scoped count.
-  let needsCount = $derived(
-    day.offset === 0 ? (overview?.pendingReview ?? 0) : obs.filter((o) => o.needsReview).length,
-  )
+  // The badge counts only the moments this day holds that the model is unsure about, the
+  // same day-scoped rule for today and any past day (contract D1). It used to show the
+  // global backlog on today, so one old uncertain moment read as if today had one to review.
+  let needsCount = $derived(obs.filter((o) => o.needsReview).length)
 
   // Cache-busting tick for the "Right now" stills, so they refresh instead of freezing on
   // the first frame. Runs only while those tiles are shown (today, with cameras) and pauses

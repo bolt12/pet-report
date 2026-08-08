@@ -794,7 +794,7 @@ contractHandlerUnits =
         r <- runHandler (Web.overviewH app)
         case r of
           Left e  -> assertFailure ("overviewH failed: " <> show e)
-          Right v -> jsonKeysV (encode v) @?= sort ["cameras", "pendingReview"]
+          Right v -> jsonKeysV (encode v) @?= sort ["cameras"]
   , testCase "batchH JSON keys match the client contract (BatchStatus)" $
       withFakeApp id $ \app -> do
         r <- runHandler (Web.batchH app Nothing)

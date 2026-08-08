@@ -203,8 +203,6 @@ export interface CameraStatus {
 export interface Overview {
   cameras: CameraStatus[]
   earliestDay?: string | null
-  // The global needs-a-look backlog size, for the badge.
-  pendingReview: number
 }
 
 export interface Tile {
