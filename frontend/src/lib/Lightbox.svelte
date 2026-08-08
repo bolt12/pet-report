@@ -3,7 +3,7 @@
   import Chip from './Chip.svelte'
   import WellbeingDot from './WellbeingDot.svelte'
   import { api, type ObsView, type Pet } from './api'
-  import { fmtTime, friendlyError, serverMessage, BEHAVIOUR_FLAGS, type BehaviourFlag } from './ui'
+  import { fmtWhen, friendlyError, serverMessage, BEHAVIOUR_FLAGS, type BehaviourFlag } from './ui'
 
   let {
     obs,
@@ -279,7 +279,7 @@
     <div class="lg:w-[400px] lg:flex-shrink-0 lg:overflow-y-auto lg:pt-[2px] lg:pr-[4px]" data-scroll>
     <div class="mb-[8px] flex items-center gap-[8px]">
       <WellbeingDot wellbeing={obs.wellbeing} size={9} />
-      <span class="font-head text-[15px] font-semibold" style="color:#f4ece3">{fmtTime(obs.at)}</span>
+      <span class="font-head text-[15px] font-semibold" style="color:#f4ece3">{fmtWhen(obs.at)}</span>
       <span style="color:rgba(255,246,236,0.4)">·</span>
       <span class="text-[14px] font-semibold" style="color:rgba(255,246,236,0.7)">{obs.room}</span>
     </div>

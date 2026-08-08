@@ -125,9 +125,9 @@ batchDeadlineSecs :: NominalDiffTime
 batchDeadlineSecs = 20 * 60
 
 -- | The most events one ingest pass pulls from Frigate in a single request. Frigate returns
--- them OLDEST first, so a pass takes the oldest @limit@ after the watermark and defers the
--- rest, and a long absence catches up a page at a time. Set well above the busiest observed
--- day, so a normal batch drains in one request.
+-- them OLDEST first, so a request takes the oldest @limit@ after the watermark and 'sweepWindow'
+-- asks again from there. Set well above the busiest observed day, so a normal batch drains in
+-- one request.
 eventFetchLimit :: Int
 eventFetchLimit = 500
 
@@ -367,30 +367,33 @@ buildDay app day = withBatchLock app $ do
         -- discarded and eventStored dedups the overlap.
         lo = posixSecs loT - cursorEpsilon
         hi = posixSecs hiT
-    drained <- sweepWindow app budget prof lo hi
+    end <- sweepWindow app budget prof lo hi
     finishReportFor app prof day False
     -- Marked only once the day's own events are all in AND its story is written, so a
     -- rebuild that stopped short, or whose narrative call failed, leaves the day open: the
     -- notice still says so and a second press picks up where this one stopped.
-    when drained (Db.setDaySwept (appDb app) day)
+    when (end >= hi) (Db.setDaySwept (appDb app) day)
 
--- | Ingest @[lo, hi)@ to its end, a page at a time. 'True' if it drained.
+-- | Ingest @[lo, hi)@ page by page until it stops moving. Returns where the cursor stopped,
+-- which is @hi@ exactly when the window drained.
 --
--- 'ingestWindow' takes one page of 'eventFetchLimit' per call, which is right for the daily
--- batch: its watermark persists, so the next batch resumes from it. A rebuild discards the
--- watermark, so a single call would cap a day at one page however much of the window is
--- left, and pressing again would re-read the same page forever.
+-- 'ingestWindow' takes one page of 'eventFetchLimit' per call and parks the cursor below the
+-- last event of a full page, since a full page means there may be more. Left at that, a run
+-- stops after 500 events however cheap they were: an event already stored, cooldown-skipped
+-- or flagged a false positive advances the cursor for free, so a backlog of work already done
+-- would still cost one run per 500 to walk past, at twelve hours a run for the daily batch.
+-- The budget bounds the work, so the page count does not have to.
 --
--- Terminates on any of the three ways forward stops: reaching @hi@, spending the budget, or a
--- fetch that failed. All three leave the returned watermark at or below where the page began.
-sweepWindow :: App -> Budget -> Profile -> Double -> Double -> IO Bool
+-- Terminates on any of the three ways forward stops: reaching @hi@, a budget with nothing
+-- left to give, or a fetch that failed. Each leaves the cursor at or below where its page
+-- began. The number of pages is bounded by the window, which 'clampToRetention' keeps inside
+-- Frigate's own retention.
+sweepWindow :: App -> Budget -> Profile -> Double -> Double -> IO Double
 sweepWindow app budget prof lo hi = go lo
   where
     go from = do
       to <- ingestWindowSafe app budget prof from hi
-      if to >= hi
-        then pure True
-        else if to <= from then pure False else go to
+      if to >= hi || to <= from then pure to else go to
 
 -- | How a batch run ended, for the honest last-batch state the UI reads. The wire
 -- form is "ok", "error" or "skipped" (see 'runOutcomeText'), which is what @batchH@ stores
@@ -544,8 +547,8 @@ sampleObs ts cam scene =
     }
 
 -- | The daily batch's event catch-up: advance the global watermark through the events since
--- it, oldest-first, then persist it. A long absence catches up a page per pass, while a
--- normal batch needs a single request.
+-- it, oldest-first, then persist it. A normal batch needs a single request; a long absence
+-- keeps paging until the work, not the page count, runs out (see 'sweepWindow').
 --
 -- Returns the past days this pass could still add to, each with what it held beforehand, for
 -- 'repairLateDays' to compare against once the batch has finished storing. The pair is taken
@@ -560,7 +563,7 @@ ingestEvents app budget prof = do
   wm <- clampToRetention app nowP stored
   let stale = lateDayCandidates tz now wm
   before <- traverse (countObsOn app tz now) stale
-  newWm <- ingestWindowSafe app budget prof wm nowP
+  newWm <- sweepWindow app budget prof wm nowP
   Db.setIngestWatermark (appDb app) newWm
   pure (zip stale before)
 

@@ -213,6 +213,13 @@ export function fmtTime(iso: string): string {
   }
 }
 
+// A moment's day and clock time together ("Today · 08:14 AM", "Sat, 8 Aug · 3:20 PM"),
+// for a viewer that may show a moment from any day (keepsakes, a pet's history, Ask
+// proof). Reuses dayLabel so a recent day reads relatively and an older one by date.
+export function fmtWhen(iso: string): string {
+  return `${dayLabel(offsetForIso(ymdOf(iso)))} · ${fmtTime(iso)}`
+}
+
 export function relTime(iso: string): string {
   const then = new Date(iso).getTime()
   const mins = Math.round((Date.now() - then) / 60000)

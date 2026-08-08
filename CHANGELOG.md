@@ -20,6 +20,8 @@ Notable changes to pet-report, newest first.
 
 ### Minor changes
 
+- An opened moment shows its date beside the time, so a keepsake or a moment
+  reached from search says which day it belongs to.
 - A batch is bounded by time, not by a count of jobs. Ingest gets the first 70% of
   the window, frame analysis the rest. A batch that is catching up now runs the
   full twenty minutes.
@@ -37,9 +39,13 @@ Notable changes to pet-report, newest first.
   be starved by whichever camera sorted first.
 - A day's story is rewritten when its moments arrive late. Only its timeline and
   stats used to heal.
-- Rebuilding a past day now finishes it: it works through the whole day rather
-  than one page of 500 events, uses the full window rather than the 70% reserved
-  for a frame queue it never touches, and clears the catch-up notice when done.
+- Ingest keeps going until the work runs out, not after 500 events. Events that
+  cost nothing (already stored, deduped, false positives) advanced the cursor for
+  free but still counted against the page, so a backlog with no work left in it
+  took one batch per 500 to walk past, twelve hours apart.
+- Rebuilding a past day now finishes it: it works through the whole day, uses the
+  full window rather than the 70% reserved for a frame queue it never touches,
+  and clears the catch-up notice when done.
 - The refresh spinner gave up after three minutes, less than a batch may take, so
   it cleared mid-run and reported the previous run's outcome.
 - The wellbeing line no longer claims a moment is flagged when the flag came from

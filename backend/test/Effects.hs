@@ -597,6 +597,39 @@ pipelineUnits =
         assertBool
           ("yesterday's narrative was replaced once its queued frame was analysed, got " <> show stored)
           (stored /= Just "nothing happened")
+  , testCase "one batch walks the watermark past a backlog it has no work to do on" $
+      -- The page limit throttles the cursor, not the work: an event already stored,
+      -- cooldown-skipped or flagged a false positive advances it for free. Stopping after a
+      -- page anyway meant a watermark 501 free events behind took two batches, twelve hours
+      -- apart, to reach the one event that needed anything. The budget bounds the work, so
+      -- the page count does not have to.
+      withFakeApp id $ \app0 -> do
+        Db.putProfile (appDb app0) catProfile
+        let fixedNow = UTCTime (fromGregorian 2026 8 6) (12 * 3600)
+            dayStart = posixSecs (UTCTime (fromGregorian 2026 8 6) 0)
+            -- One past a full page, so a single fetch cannot reach the end of them.
+            evs =
+              [ mkEvent
+                  { feId = T.pack ("free-" <> show i)
+                  , feFalsePositive = True
+                  , feStart = dayStart + fromIntegral i * 60
+                  }
+              | i <- [1 .. 501 :: Int]
+              ]
+            app =
+              app0
+                { appClock = Clock.Handle {Clock.now = pure fixedNow, Clock.timeZone = pure utcTZ}
+                , appFrigate =
+                    fakeFrigate
+                      { Frigate.recentEvents = \_ after _ lim ->
+                          pure (Just (take lim (filter ((> after) . feStart) evs)))
+                      }
+                , appLlm = fakeLlm (const (pure (answer sceneReply)))
+                }
+        Db.setIngestWatermark (appDb app) dayStart
+        Pipeline.batch app
+        -- All the way to now, not parked just below the 500th event.
+        Db.getIngestWatermark (appDb app) >>= (@?= Just (posixSecs fixedNow))
   , testCase "a person event is fetched and stored, and never counts as a pet sighting" $
       -- The whole point of fetching people is the pet sitter arriving. Which labels are
       -- fetched is config; who is in the frame is the model's call, and a person resolves to
