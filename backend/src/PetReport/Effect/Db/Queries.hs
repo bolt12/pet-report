@@ -23,6 +23,8 @@ module PetReport.Effect.Db.Queries
   , setState
   , getIngestWatermark
   , setIngestWatermark
+  , getIngestDrained
+  , setIngestDrained
   , getDaySwept
   , setDaySwept
   , insertReport
@@ -621,6 +623,20 @@ setDaySwept h day = setState h (daySweptKey day) "1"
 
 daySweptKey :: Day -> Text
 daySweptKey day = "day_swept_" <> T.pack (showGregorian day)
+
+-- | Whether the last scheduled ingest drained its window rather than parking on a backlog.
+-- The current day's catch-up notice reads this instead of comparing the watermark to the
+-- clock: between batches the watermark is legitimately behind "now", so the honest question
+-- is whether work is outstanding, not whether the frontier sits at this exact instant. Absent
+-- (a fresh install, or the first run after upgrading) reads as drained, so nothing cries wolf.
+getIngestDrained :: Handle -> IO Bool
+getIngestDrained h = maybe True (== "1") <$> getState h ingestDrainedKey
+
+setIngestDrained :: Handle -> Bool -> IO ()
+setIngestDrained h drained = setState h ingestDrainedKey (if drained then "1" else "0")
+
+ingestDrainedKey :: Text
+ingestDrainedKey = "ingest_drained"
 
 -- | Store the report for its (day, period), refreshing the narrative in place if one
 -- already exists. The unique index makes this an upsert rather than a duplicate row.

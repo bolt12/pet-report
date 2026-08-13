@@ -565,6 +565,10 @@ ingestEvents app budget prof = do
   before <- traverse (countObsOn app tz now) stale
   newWm <- sweepWindow app budget prof wm nowP
   Db.setIngestWatermark (appDb app) newWm
+  -- Reaching the window's end means no backlog is left; parking below it means the budget or
+  -- the event volume stopped this pass short. The current day's notice reads this rather than
+  -- the watermark, so a normal between-batch lag does not read as falling behind.
+  Db.setIngestDrained (appDb app) (newWm >= nowP)
   pure (zip stale before)
 
 -- | Rewrite the story of any past day this batch actually added to.

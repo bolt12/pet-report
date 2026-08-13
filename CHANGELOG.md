@@ -33,6 +33,11 @@ Notable changes to pet-report, newest first.
 
 ### Bug fixes
 
+- The "still catching up" notice on today no longer shows all day long. It compared the
+  ingest watermark against the clock, but the watermark only reaches the present for an
+  instant when a batch runs, so today read as behind for the hours between batches. It now
+  reflects whether the last ingest left a backlog, so the normal wait for the next batch is
+  not mistaken for falling behind.
 - The Today "moments to review" badge counts only that day now, like every other day. It
   showed the global needs-a-look backlog, so a single old uncertain moment made today read
   as having one to review, and tapping opened that months-old moment. The whole backlog is

@@ -148,11 +148,17 @@ batchH app mday = liftIO $ do
 -- cannot rewind steady-state ingest. Asking the watermark alone would therefore keep the
 -- notice up on a day the owner had just finished, no matter how often they pressed it.
 --
--- The watermark test is against the END of that day, never against "now". A caught-up
--- system's watermark is legitimately hours old between batches, so comparing with now would
--- report the app as behind twice a day, every day, and the notice would be noise within a
--- week. A day still in progress is caught up once the watermark reaches the present, which is
--- what comparing against @min dayEnd now@ gives.
+-- A finished day (its end is behind us) is caught up once the watermark has passed that end.
+-- The test is against the day's END, never "now": a caught-up system's watermark is
+-- legitimately hours old between batches, so comparing with now would report a finished day
+-- as behind twice a day, every day, and the notice would be noise within a week.
+--
+-- An open day, today, cannot be judged that way: its end is in the future, so the watermark
+-- can never reach it, and comparing with "now" instead would flag today as behind for the
+-- whole gap between batches, since the watermark only touches the present for an instant when
+-- a batch runs. What actually matters is whether outstanding work is piling up, so an open day
+-- reads the drained flag: the last ingest either reached its window's end (nothing outstanding)
+-- or parked on a backlog the owner can act on. A normal between-batch lag is not falling behind.
 --
 -- No watermark at all reads as caught up: a fresh install has nothing outstanding, and saying
 -- otherwise on first run would be a lie the owner cannot act on.
@@ -160,9 +166,10 @@ caughtUpOn :: App -> TZ -> UTCTime -> Maybe Text -> IO Bool
 caughtUpOn app tz now mday = do
   -- Resolved exactly as 'resolveRefresh' resolves it, so the notice and the refresh button
   -- can never disagree about which day they mean.
-  let day = case mday of
+  let today = localDayOf tz now
+      day = case mday of
         Just raw | recognizedArg raw -> resolveDay tz now raw
-        _                            -> localDayOf tz now
+        _                            -> today
   swept <- Db.getDaySwept (appDb app) day
   if swept
     then pure True
@@ -170,7 +177,13 @@ caughtUpOn app tz now mday = do
       stored <- Db.getIngestWatermark (appDb app)
       case stored of
         Nothing -> pure True
-        Just secs -> do
-          let (_, dayEnd) = localDayWindow tz now day
-              wm = posixSecondsToUTCTime (realToFrac secs)
-          pure (wm >= min dayEnd now)
+        Just secs ->
+          -- An open day (today, or later) is judged by the drained flag; a finished day, by
+          -- whether the watermark has passed its end. localDayWindow already clamps a day's
+          -- end to now, so the split is on the calendar day, not that clamped bound.
+          if day >= today
+            then Db.getIngestDrained (appDb app)
+            else do
+              let (_, dayEnd) = localDayWindow tz now day
+                  wm = posixSecondsToUTCTime (realToFrac secs)
+              pure (wm >= dayEnd)

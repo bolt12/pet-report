@@ -801,10 +801,11 @@ contractHandlerUnits =
         case r of
           Left e  -> assertFailure ("batchH failed: " <> show e)
           Right v -> jsonKeysV (encode v) @?= sort ["running", "last", "caughtUp"]
-  , testCase "caughtUp compares the watermark to the day's end, not to the clock" $
-      -- Between batches a caught-up app's watermark is legitimately hours old. Comparing it
-      -- with "now" would report the app as behind twice a day forever, and a notice that
-      -- cries wolf is worse than none.
+  , testCase "caughtUp on an open day follows whether ingest drained, a finished day its end" $
+      -- Between batches a caught-up app's watermark is legitimately hours old, so comparing it
+      -- with "now" would report today as behind for most of every day, and a notice that cries
+      -- wolf is worse than none. Today is judged on whether the last ingest left a backlog; a
+      -- finished day, on whether the watermark has passed its end.
       withFakeApp id $ \app0 -> do
         let fixedNow = UTCTime (fromGregorian 2026 8 6) (12 * 3600)
             app = app0 {appClock = Clock.Handle {Clock.now = pure fixedNow, Clock.timeZone = pure utcTZ}}
@@ -815,11 +816,16 @@ contractHandlerUnits =
                 Right v -> pure (fromMaybe Null (KeyMap.lookup "caughtUp" (objOf v)))
         -- No watermark at all: a fresh install has nothing outstanding.
         caughtUpFor Nothing >>= (@?= Bool True)
-        -- Swept up to 08:00 today, four hours before "now": today is NOT done.
+        -- Swept to 08:00 today, four hours before "now". The last ingest drained its window, so
+        -- today is caught up despite the watermark being hours old: no crying wolf.
         Db.setIngestWatermark (appDb app) (posixSecs (UTCTime (fromGregorian 2026 8 6) (8 * 3600)))
+        Db.setIngestDrained (appDb app) True
+        caughtUpFor Nothing >>= (@?= Bool True)
+        -- The last ingest parked on a backlog: now today genuinely has work to catch up on.
+        Db.setIngestDrained (appDb app) False
         caughtUpFor Nothing >>= (@?= Bool False)
-        -- That same watermark is past the END of yesterday, so yesterday IS done, even
-        -- though the watermark is many hours older than the clock.
+        -- The drained flag governs only the open day. Yesterday is finished and its end is
+        -- behind that 08:00 watermark, so it stays caught up whatever the flag says.
         caughtUpFor (Just "2026-08-05") >>= (@?= Bool True)
   , testCase "rebuilding a past day catches it up, though the watermark stays put" $
       -- The notice offers a rebuild, and a rebuild sweeps that day's own window while
