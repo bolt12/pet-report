@@ -87,6 +87,8 @@ import           PetReport.Pipeline.Queue     (listJpgs, writeQueueFrame)
 import           PetReport.Trace              (dbTracer, ntfyTracer,
                                                renderingTracer)
 import qualified PetReport.Web                as Web
+import           PetReport.Web.Facets         (ActivitySel (..),
+                                               SubjectSel (..))
 import           PetReport.Web.Ops            (askH)
 import           PetReport.Web.Types          (AskReq (..))
 import           PetReport.Pipeline.Worker    (newJobs)
@@ -738,12 +740,35 @@ webUnits =
                 (Seen emptyScene {appearances = [Appearance (AnAnimal (Species "cat")) act noBehaviors Nothing]})
         Db.insertObservation (appDb app) (mk Sleeping 10)
         Db.insertObservation (appDb app) (mk Playing 20)
+        -- from to subject activity behaviour wellbeing room camera media timeOfDay
+        -- review search sort cursor limit
         let browse act =
-              Web.momentsH app Nothing Nothing Nothing act Nothing Nothing Nothing Nothing Nothing Nothing Nothing (Just 50)
+              Web.momentsH app Nothing Nothing [] act Nothing Nothing Nothing [] Nothing Nothing Nothing Nothing Nothing Nothing (Just 50)
         rAll <- runHandler (browse Nothing)
         (totalOf <$> rAll) @?= Right (Just 2)
-        rPlay <- runHandler (browse (Just "playing"))
+        rPlay <- runHandler (browse (Just (ActivitySel Playing)))
         (totalOf <$> rPlay) @?= Right (Just 1)
+        -- The subject facet the browse used to lack entirely. A person sighting is
+        -- reachable now; before, the only way to ask was through the pet slot, which
+        -- answered 200 with nothing in it.
+        let subjBrowse ss =
+              Web.momentsH app Nothing Nothing ss Nothing Nothing Nothing Nothing [] Nothing Nothing Nothing Nothing Nothing Nothing (Just 50)
+        Db.insertObservation
+          (appDb app)
+          ( NewObservation
+              (addSecs 30 now)
+              (Camera "office")
+              PeriodicSample
+              (Seen emptyScene {appearances = [Appearance APerson Standing noBehaviors Nothing]})
+          )
+        rPerson <- runHandler (subjBrowse [SelPerson])
+        (totalOf <$> rPerson) @?= Right (Just 1)
+        rCat <- runHandler (subjBrowse [SelSpecies "cat"])
+        (totalOf <$> rCat) @?= Right (Just 2)
+        -- Two subjects AND together: no single moment here holds both a cat and a person,
+        -- so asking for both returns nothing even though each alone matches.
+        rBoth <- runHandler (subjBrowse [SelSpecies "cat", SelPerson])
+        (totalOf <$> rBoth) @?= Right (Just 0)
   , testCase "pet add/edit/archive round-trips through the profile (409 on a dup id)" $
       withFakeApp id $ \app -> do
         let pet = Pet (PetId "yuki") "Yuki" (Species "cat") "grey cat" Nothing Nothing Nothing

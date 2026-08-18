@@ -87,7 +87,14 @@
     }
     if (s === 'review') {
       // A string arg is a quick preset key; an object is a full deep-link preset.
-      const keyed: Record<string, ReviewPreset> = { needs: { needs: true }, visitor: { who: ['visitor'] } }
+      // Quick-nav keys, each mapping to a real query. 'visitor' used to map to
+      // `{ who: ['visitor'] }`, which Review fed into the pet slot and sent as
+      // `pet=visitor`, a pet id no roster holds. It answered 200 with nothing.
+      const keyed: Record<string, ReviewPreset> = {
+        needs: { review: 'needs-look' },
+        person: { subject: [{ kind: 'person' }] },
+        visiting: { subject: [{ kind: 'visiting' }] },
+      }
       reviewPreset = typeof arg === 'object' ? arg : (keyed[arg ?? ''] ?? {})
     } else {
       reviewPreset = {}

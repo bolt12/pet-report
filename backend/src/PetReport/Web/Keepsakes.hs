@@ -22,10 +22,10 @@ import           PetReport.Domain.Observation (FrigateMeta (..), origin,
                                                originMeta)
 import           PetReport.Domain.Profile     (Profile (..))
 import           PetReport.Domain.Types       (EventId (..))
+import           PetReport.Domain.View        (proofRetainDays)
 import qualified PetReport.Effect.Clock       as Clock
 import qualified PetReport.Effect.Db          as Db
 import qualified PetReport.Effect.Frigate     as Frigate
-import qualified PetReport.Pipeline           as Pipeline
 import           PetReport.View.Enrich        (mkKeepsake)
 import           PetReport.Web.Media          (removeOwnedMedia, saveOwnedMedia)
 import           PetReport.Web.Types          (KeepsakeReq (..), OkResp (..))
@@ -43,7 +43,7 @@ keepsakesH app mpet = liftIO $ do
   obsById <- Db.getObservationsByIds (appDb app) (map Db.kObsId ks)
   let crs = cameras prof
       items =
-        [ mkKeepsake Pipeline.proofRetainDays crs now k obs
+        [ mkKeepsake proofRetainDays crs now k obs
         | k <- ks
         , Just obs <- [Map.lookup (Db.kObsId k) obsById]
         ]

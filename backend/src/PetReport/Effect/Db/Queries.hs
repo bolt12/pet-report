@@ -19,20 +19,14 @@ module PetReport.Effect.Db.Queries
   , deleteObservation
   , deleteObservations
   , purgePetAndProfile
-  , getState
-  , setState
-  , getIngestWatermark
-  , setIngestWatermark
-  , getIngestDrained
-  , setIngestDrained
-  , getDaySwept
-  , setDaySwept
   , insertReport
   , reportExists
   , latestReport
   , eventStored
   , recentEventStarts
   , correctObservation
+  , addObservationSighting
+  , removeObservationSighting
   , revertObservation
   , editObservation
   , reprojectAll
@@ -41,15 +35,6 @@ module PetReport.Effect.Db.Queries
   , obsEventId
   , setTranscript
   , transcriptsFor
-  , Keepsake (..)
-  , insertKeepsake
-  , listKeepsakes
-  , keptObsIds
-  , keptSampleStamps
-  , deleteKeepsake
-  , PetSummary (..)
-  , getPetSummary
-  , putPetSummary
   , schemaVersion
     -- Low-level row helpers shared with "PetReport.Effect.Db.Browse".
   , ObsRow
@@ -59,22 +44,18 @@ module PetReport.Effect.Db.Queries
   ) where
 
 import           Control.Monad                  (forM_, when)
-import           Data.Aeson                     (ToJSON (..), decodeStrict,
-                                                 eitherDecodeStrict,
-                                                 genericToJSON)
+import           Data.Aeson                     (eitherDecodeStrict)
 import           Data.Aeson.Text                (encodeToLazyText)
 import           Data.Either                    (partitionEithers)
 import           Data.Int                       (Int64)
 import           Data.Map.Strict                (Map)
 import qualified Data.Map.Strict                as Map
-import           Data.Maybe                     (fromMaybe, isJust,
-                                                 listToMaybe)
+import           Data.Maybe                     (listToMaybe)
 import           Data.Text                      (Text)
 import qualified Data.Text                      as T
 import           Data.Text.Encoding             (encodeUtf8)
 import qualified Data.Text.Lazy                 as TL
 import           Data.Time                      (Day, UTCTime, getCurrentTime)
-import           Data.Time.Calendar             (showGregorian)
 import           Database.SQLite.Simple         (Connection, Only (..),
                                                  Query (..), changes, execute,
                                                  execute_, fromOnly,
@@ -83,35 +64,33 @@ import           Database.SQLite.Simple         (Connection, Only (..),
                                                  (:.) (..))
 import           Database.SQLite.Simple.FromRow (FromRow (..))
 import           GHC.Generics                   (Generic)
-import           Text.Read                      (readMaybe)
 
 import           PetReport.Domain.Observation   (FrigateMeta (..),
                                                  NewObservation (..),
                                                  Observation (..), Origin (..),
                                                  originMeta)
 import           PetReport.Domain.Perception    (Correction (..), Perception,
-                                                 SceneEdit, applyCorrection,
-                                                 applyEdit)
-import           PetReport.Domain.PetReport     (WellbeingKind,
-                                                 wellbeingKindFromText,
-                                                 wellbeingKindText)
+                                                 Perception (..), SceneEdit,
+                                                 Who, addSighting,
+                                                 applyCorrectionAt, applyEditAt,
+                                                 hasSightingAt, removeSightingAt)
 import           PetReport.Domain.Profile       (Overrides, Profile,
                                                  SubjectId (..), emptyProfile)
 import           PetReport.Domain.Report        (Period (..), Report (..),
                                                  periodText)
 import           PetReport.Domain.Stats         (PetStat (..), SubjectFact (..),
-                                                 SubjectKey (..), factsOf,
-                                                 isUncertain)
+                                                 StoredStats (..),
+                                                 SubjectKey (..), confidenceOf,
+                                                 factsOf, needsLook)
 import           PetReport.Domain.Types         (Camera (..), EventId (..),
                                                  ObsId (..), PetId (..),
                                                  Species (..), cameraText,
                                                  petIdText)
-import           PetReport.Effect.Db.Facts      (boolToInt, confOf,
+import           PetReport.Effect.Db.Facts      (boolToInt,
                                                  decodePerception, writeFacts)
 import           PetReport.Effect.Db.Handle     (Handle (..), withConn)
 import           PetReport.Effect.Db.Migrations (currentVersion)
 import           PetReport.Effect.Db.Sql        (fromPosix, placeholders, posixOf)
-import           PetReport.Util                 (prefixed)
 import           PetReport.Trace                (DbEvent (..), Tracer, traceWith)
 
 -- Every WRITE transaction uses 'withImmediateTransaction' (BEGIN IMMEDIATE), not
@@ -178,8 +157,8 @@ reprojectAll h = withConn h $ \c -> withImmediateTransaction c $ do
         -- projection-logic or threshold change rather than only the facts.
         execute
           c
-          "UPDATE observations SET confidence = ?, uncertain = ? WHERE id = ?"
-          (confOf p, boolToInt (isUncertain p), oid)
+          "UPDATE observations SET confidence = ?, needs_look = ? WHERE id = ?"
+          (confidenceOf p, boolToInt (needsLook p), oid)
       Left _  -> pure ()
   pure (length rows)
 
@@ -261,7 +240,7 @@ insertObservation h obs = withConn h $ \c -> withImmediateTransaction c $ do
   execute
     c
     "INSERT OR IGNORE INTO observations \
-    \(ts, camera, source, event_id, label, score, perception, reviewed, confidence, raw_perception, uncertain, has_clip, has_snapshot) \
+    \(ts, camera, source, event_id, label, score, perception, reviewed, confidence, raw_perception, needs_look, has_clip, has_snapshot) \
     \VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
     ( ( posixOf (noAt obs)
       , cameraText (noCamera obs)
@@ -273,10 +252,10 @@ insertObservation h obs = withConn h $ \c -> withImmediateTransaction c $ do
       -- A newly-ingested row is always unreviewed. 'NewObservation' carries no review
       -- flag, so this is 0 by construction rather than a value read off the input.
       , 0 :: Int
-      , confOf (noPerception obs)
+      , confidenceOf (noPerception obs)
       , perc
       )
-        :. ( boolToInt (isUncertain (noPerception obs))
+        :. ( boolToInt (needsLook (noPerception obs))
            , fmap (\fm -> if detectorHasClip fm then 1 else 0 :: Int) m
            , fmap (\fm -> if detectorHasSnapshot fm then 1 else 0 :: Int) m
            )
@@ -307,7 +286,7 @@ observationsBetween h lo hi = withConn h $ \c -> do
 -- species, a visiting animal is dropped, and everything else stays keyed by species for the
 -- caller's unique-species rule. This is 'identifyWith' expressed relationally, so it agrees
 -- with the blob-path 'presence' over the same window.
-subjectStatsBetween :: Handle -> UTCTime -> UTCTime -> IO (Map SubjectKey PetStat)
+subjectStatsBetween :: Handle -> UTCTime -> UTCTime -> IO StoredStats
 subjectStatsBetween h lo hi = withConn h $ \c -> do
   rows <-
     query
@@ -321,6 +300,7 @@ subjectStatsBetween h lo hi = withConn h $ \c -> do
       \GROUP BY os.species, si.pet_id"
       (posixOf lo, posixOf hi)
   pure $
+    StoredStats $
     Map.fromListWith
       (<>)
       [ (key, PetStat sight rest act ate drank slept played groomed elim concern)
@@ -577,66 +557,8 @@ purgePetBody tracer c pid = do
   pure deleted
 
 -- --------------------------------------------------------------------------- --
--- State (watermark) and reports
+-- Reports
 -- --------------------------------------------------------------------------- --
-
-getState :: Handle -> Text -> IO (Maybe Text)
-getState h key = withConn h $ \c -> do
-  rows <- query c "SELECT v FROM state WHERE k = ?" (Only key)
-  pure (fromOnly <$> listToMaybe rows)
-
-setState :: Handle -> Text -> Text -> IO ()
-setState h key val = withConn h $ \c ->
-  execute
-    c
-    "INSERT INTO state (k, v) VALUES (?, ?) \
-    \ON CONFLICT(k) DO UPDATE SET v = excluded.v"
-    (key, val)
-
--- | The ingest watermark: the POSIX-second @start_time@ the event sweep has advanced past.
--- 'Nothing' before the first sweep has ever run, which is a fresh install rather than a
--- stalled one, so the two stay distinguishable.
---
--- Typed here rather than left to each caller. The pipeline writes it and the web layer reads
--- it to answer "is this day caught up", and a key string or a parse that drifted between the
--- two would read as "never ingested" and quietly answer yes to everything.
-getIngestWatermark :: Handle -> IO (Maybe Double)
-getIngestWatermark h = (>>= readMaybe . T.unpack) <$> getState h ingestWatermarkKey
-
-setIngestWatermark :: Handle -> Double -> IO ()
-setIngestWatermark h = setState h ingestWatermarkKey . T.pack . show
-
-ingestWatermarkKey :: Text
-ingestWatermarkKey = "last_event_ts"
-
--- | Whether a past day's own event window has been swept to its end.
---
--- A day rebuild sweeps that one day straight from Frigate and deliberately leaves the global
--- watermark alone, so rebuilding an old day cannot rewind steady-state ingest. That makes the
--- watermark the wrong thing to ask "is this day finished": it can sit weeks behind a day that
--- is in fact complete. This is the per-day answer, set once a rebuild drains the day.
-getDaySwept :: Handle -> Day -> IO Bool
-getDaySwept h day = isJust <$> getState h (daySweptKey day)
-
-setDaySwept :: Handle -> Day -> IO ()
-setDaySwept h day = setState h (daySweptKey day) "1"
-
-daySweptKey :: Day -> Text
-daySweptKey day = "day_swept_" <> T.pack (showGregorian day)
-
--- | Whether the last scheduled ingest drained its window rather than parking on a backlog.
--- The current day's catch-up notice reads this instead of comparing the watermark to the
--- clock: between batches the watermark is legitimately behind "now", so the honest question
--- is whether work is outstanding, not whether the frontier sits at this exact instant. Absent
--- (a fresh install, or the first run after upgrading) reads as drained, so nothing cries wolf.
-getIngestDrained :: Handle -> IO Bool
-getIngestDrained h = maybe True (== "1") <$> getState h ingestDrainedKey
-
-setIngestDrained :: Handle -> Bool -> IO ()
-setIngestDrained h drained = setState h ingestDrainedKey (if drained then "1" else "0")
-
-ingestDrainedKey :: Text
-ingestDrainedKey = "ingest_drained"
 
 -- | Store the report for its (day, period), refreshing the narrative in place if one
 -- already exists. The unique index makes this an upsert rather than a duplicate row.
@@ -706,10 +628,15 @@ eventStored h eid = withConn h $ \c -> do
 -- Correction
 -- --------------------------------------------------------------------------- --
 
--- | Rewrite an observation's stored perception by @f@ and mark it reviewed.
--- Returns 'False' if the id is unknown. Shared by owner corrections and edits.
-updateObservationPerception :: Handle -> Int64 -> (Perception -> Perception) -> IO Bool
-updateObservationPerception h oid f = do
+-- | Rewrite an observation's stored perception by @f@ and mark it reviewed, but only when
+-- the stored perception satisfies @ok@. Shared by owner corrections and edits.
+--
+-- The guard runs on the row already read inside the transaction, so a sighting-range check
+-- cannot race a concurrent edit that shrinks the scene. 'False' when the id is unknown OR
+-- the guard rejects, which the handlers both render as a 404.
+updateObservationPerceptionIf ::
+  Handle -> Int64 -> (Perception -> Bool) -> (Perception -> Perception) -> IO Bool
+updateObservationPerceptionIf h oid ok f = do
   now <- getCurrentTime
   -- Read and write on one connection inside a transaction, so two overlapping corrections
   -- serialize instead of losing an update, and the UPDATE and re-projection commit
@@ -718,63 +645,125 @@ updateObservationPerception h oid f = do
     m <- getObservationC c oid
     case m of
       Nothing -> pure False
+      Just obs | not (ok (perception obs)) -> pure False
       Just obs -> do
         let p' = f (perception obs)
         execute
           c
-          "UPDATE observations SET perception = ?, reviewed = 1, reviewed_at = ?, confidence = ?, uncertain = ? WHERE id = ?"
-          (TL.toStrict (encodeToLazyText p'), posixOf now, confOf p', boolToInt (isUncertain p'), oid)
+          "UPDATE observations SET perception = ?, reviewed = 1, reviewed_at = ?, confidence = ?, needs_look = ? WHERE id = ?"
+          (TL.toStrict (encodeToLazyText p'), posixOf now, confidenceOf p', boolToInt (needsLook p'), oid)
         -- Re-project the facts. raw_perception stays untouched, so the model's original
         -- reading survives the correction as an audit trail.
         writeFacts c oid p'
         pure True
 
--- | Apply an owner correction. A species or person target rewrites the perception blob,
--- retargeting the animal appearances. A specific-pet or visiting target is an /individual/
+-- | Apply an owner correction to ONE sighting. A species or person target rewrites that
+-- sighting inside the perception blob. A specific-pet or visiting target is an /individual/
 -- attribution stored as an override, which leaves both the blob and @raw_perception@
--- species-level. A person target also clears any such override.
-correctObservation :: Handle -> Int64 -> Correction -> IO Bool
-correctObservation h oid corr = case corr of
-  ToPet pid   -> writeOverride h oid (IdPet pid)
-  ToVisiting  -> writeOverride h oid IdVisiting
-  ToSpecies _ -> updateObservationPerception h oid (applyCorrection corr)
-  ToPerson    -> clearOverride h oid *> updateObservationPerception h oid (applyCorrection corr)
+-- species-level. A person target also drops that sighting's override, since a person holds
+-- no pet identity.
+--
+-- 'False' for an unknown moment or a sighting index the scene does not hold. Addressing one
+-- sighting is what lets a two-cat household name each cat in a frame that holds both; the
+-- earlier observation-scoped version wrote the same identity onto every animal in the
+-- moment, so correcting the cat also relabelled the dog beside it.
+correctObservation :: Handle -> Int64 -> Int -> Correction -> IO Bool
+correctObservation h oid ix corr = case corr of
+  ToPet pid -> writeOverride h oid ix (IdPet pid)
+  ToVisiting -> writeOverride h oid ix IdVisiting
+  ToSpecies _ -> updateSighting h oid ix (applyCorrectionAt ix corr)
+  ToPerson ->
+    clearOverrideAt h oid ix *> updateSighting h oid ix (applyCorrectionAt ix corr)
 
--- | Persist an owner identity override for every animal appearance of an observation and
--- mark it reviewed. A person appearance is never given a pet or visitor identity. Returns
--- 'False' for an unknown id.
+-- | Rewrite a perception through @f@, but only when the addressed sighting exists. Keeps
+-- the range check and the write in one transaction, so a concurrent edit cannot shrink the
+-- scene between the two.
+updateSighting :: Handle -> Int64 -> Int -> (Perception -> Perception) -> IO Bool
+updateSighting h oid ix = updateObservationPerceptionIf h oid (hasSightingAt ix)
+
+-- | Persist an owner identity override for ONE animal sighting and mark the moment
+-- reviewed. A person sighting is never given a pet or visitor identity, and addressing one
+-- returns 'False' rather than writing a row that 'identifyWith' would ignore. 'False' also
+-- for an unknown moment or an out-of-range index.
 --
 -- This deliberately does NOT call 'writeFacts' or touch @perception@ and @raw_perception@.
 -- Only the attribution changes, resolved at read time, which keeps the audit trail and the
 -- model correction rate meaningful.
-writeOverride :: Handle -> Int64 -> SubjectId -> IO Bool
-writeOverride h oid sid = do
+writeOverride :: Handle -> Int64 -> Int -> SubjectId -> IO Bool
+writeOverride h oid ix sid = do
   now <- getCurrentTime
   withConn h $ \c -> withImmediateTransaction c $ do
     m <- getObservationC c oid
     case m of
       Nothing -> pure False
-      Just obs -> do
-        let animalSeqs = [s | (s, f) <- zip [0 ..] (factsOf (perception obs)), not (sfIsPerson f)]
-        forM_ animalSeqs $ \s ->
+      Just obs -> case drop ix (factsOf (perception obs)) of
+        (f : _) | ix >= 0 && not (sfIsPerson f) -> do
           execute
             c
             "INSERT OR REPLACE INTO subject_identity \
             \(obs_id, seq, pet_id, visiting, source, confirmed, ts) \
             \VALUES (?, ?, ?, ?, 'owner', 1, ?)"
-            (oid, s :: Int, petIdOf sid, visitingOf sid, posixOf now)
-        execute c "UPDATE observations SET reviewed = 1, reviewed_at = ? WHERE id = ?" (posixOf now, oid)
-        pure True
+            (oid, ix, petIdOf sid, visitingOf sid, posixOf now)
+          execute c "UPDATE observations SET reviewed = 1, reviewed_at = ? WHERE id = ?" (posixOf now, oid)
+          pure True
+        _ -> pure False
   where
     petIdOf (IdPet pid) = Just (petIdText pid)
     petIdOf IdVisiting  = Nothing
     visitingOf IdVisiting = 1 :: Int
     visitingOf (IdPet _)  = 0
 
--- | Drop all identity overrides for an observation.
-clearOverride :: Handle -> Int64 -> IO ()
-clearOverride h oid = withConn h $ \c ->
-  execute c "DELETE FROM subject_identity WHERE obs_id = ?" (Only oid)
+-- | Add a sighting the model missed, as a neutral appearance of @w@, and mark the moment
+-- reviewed. Appending never disturbs an existing index, so no override needs remapping.
+-- 'False' for an unknown moment or a sound, which has no sightings to add to.
+addObservationSighting :: Handle -> Int64 -> Who -> IO Bool
+addObservationSighting h oid w =
+  updateObservationPerceptionIf h oid isScene (addSighting w)
+
+-- | Drop a sighting the model invented, and mark the moment reviewed.
+--
+-- Removal is the one structural edit that RENUMBERS: every sighting after @ix@ shifts down
+-- one. The identity overrides are keyed by that position, so they are remapped in the same
+-- transaction as the blob rewrite. Without it, deleting the first of two subjects would
+-- leave the second wearing the first's identity.
+--
+-- 'False' for an unknown moment or an index the scene does not hold.
+removeObservationSighting :: Handle -> Int64 -> Int -> IO Bool
+removeObservationSighting h oid ix = do
+  now <- getCurrentTime
+  withConn h $ \c -> withImmediateTransaction c $ do
+    m <- getObservationC c oid
+    case m of
+      Nothing -> pure False
+      Just obs | not (hasSightingAt ix (perception obs)) -> pure False
+      Just obs -> do
+        let p' = removeSightingAt ix (perception obs)
+        execute
+          c
+          "UPDATE observations SET perception = ?, reviewed = 1, reviewed_at = ?, confidence = ?, needs_look = ? WHERE id = ?"
+          (TL.toStrict (encodeToLazyText p'), posixOf now, confidenceOf p', boolToInt (needsLook p'), oid)
+        -- Remap the overrides to match the new numbering: the removed one goes, and every
+        -- later one moves down. Done as delete-then-shift so the shift cannot collide with
+        -- the row it is about to overwrite.
+        execute c "DELETE FROM subject_identity WHERE obs_id = ? AND seq = ?" (oid, ix)
+        execute
+          c
+          "UPDATE subject_identity SET seq = seq - 1 WHERE obs_id = ? AND seq > ?"
+          (oid, ix)
+        writeFacts c oid p'
+        pure True
+
+-- | Whether a perception is a scene at all, so the add path can refuse a sound.
+isScene :: Perception -> Bool
+isScene p = case p of
+  Seen _  -> True
+  Heard _ -> False
+
+-- | Drop the identity override on one sighting, leaving its neighbours in the same moment
+-- alone.
+clearOverrideAt :: Handle -> Int64 -> Int -> IO ()
+clearOverrideAt h oid ix = withConn h $ \c ->
+  execute c "DELETE FROM subject_identity WHERE obs_id = ? AND seq = ?" (oid, ix)
 
 -- | Undo the owner's review or correction of a moment: restore the model's original reading
 -- from @raw_perception@, drop any identity overrides, and mark it unreviewed so it can be
@@ -792,153 +781,12 @@ revertObservation h oid = withConn h $ \c -> withImmediateTransaction c $ do
         Just raw | Right p <- eitherDecodeStrict (encodeUtf8 raw) -> do
           execute
             c
-            "UPDATE observations SET perception = ?, reviewed = 0, reviewed_at = NULL, confidence = ?, uncertain = ? WHERE id = ?"
-            (raw, confOf p, boolToInt (isUncertain p), oid)
+            "UPDATE observations SET perception = ?, reviewed = 0, reviewed_at = NULL, confidence = ?, needs_look = ? WHERE id = ?"
+            (raw, confidenceOf p, boolToInt (needsLook p), oid)
           writeFacts c oid p
         _ -> execute c "UPDATE observations SET reviewed = 0, reviewed_at = NULL WHERE id = ?" (Only oid)
       pure True
 
 -- | Apply an owner field edit to an observation and mark it reviewed.
-editObservation :: Handle -> Int64 -> SceneEdit -> IO Bool
-editObservation h oid e = updateObservationPerception h oid (applyEdit e)
-
--- --------------------------------------------------------------------------- --
--- Keepsakes
--- --------------------------------------------------------------------------- --
-
--- | An observation the owner chose to keep.
-data Keepsake = Keepsake
-  { kId      :: Int64
-  , kObsId   :: Int64
-  , kPetId   :: Maybe Text
-  , kCaption :: Maybe Text
-  , kAt      :: UTCTime
-  }
-  deriving stock (Eq, Show, Generic)
-
-instance ToJSON Keepsake where
-  toJSON = genericToJSON (prefixed 1)
-
--- | Save a moment as a keepsake, idempotently. A moment has at most one keepsake, enforced
--- by the schema's UNIQUE(obs_id) index.
---
--- A re-save happens when the Lightbox forgets it kept a moment after the owner navigates
--- away and back. It hits the conflict and DOES NOTHING, keeping the FIRST caption rather
--- than overwriting it. The existing row is then read back, so the handler returns a real
--- Keepsake with its actual id and caption whether this call created it or found it. Insert
--- and read run in one IMMEDIATE transaction, so the row selected is the one this call left.
-insertKeepsake :: Handle -> Int64 -> Maybe Text -> Maybe Text -> UTCTime -> IO Keepsake
-insertKeepsake h oid pid cap now = withConn h $ \c -> withImmediateTransaction c $ do
-  execute
-    c
-    "INSERT INTO keepsakes (obs_id, pet_id, caption, ts) VALUES (?, ?, ?, ?) \
-    \ON CONFLICT(obs_id) DO NOTHING"
-    (oid, pid, cap, posixOf now)
-  rows <-
-    query
-      c
-      "SELECT id, obs_id, pet_id, caption, ts FROM keepsakes WHERE obs_id = ?"
-      (Only oid)
-  case rows of
-    (r : _) -> pure (toKeepsake r)
-    -- Unreachable. The INSERT either created the row or it already existed, so a row for
-    -- this obs_id is always present by the time we read on the same connection in the same
-    -- transaction. Fall back to the caller's values rather than failing.
-    []      -> pure (Keepsake 0 oid pid cap now)
-
--- | All keepsakes, newest first, optionally filtered to one pet's.
-listKeepsakes :: Handle -> Maybe Text -> IO [Keepsake]
-listKeepsakes h mpid = withConn h $ \c -> do
-  rows <- case mpid of
-    Just pid ->
-      query
-        c
-        "SELECT id, obs_id, pet_id, caption, ts FROM keepsakes \
-        \WHERE pet_id = ? ORDER BY ts DESC"
-        (Only pid)
-    Nothing ->
-      query_ c "SELECT id, obs_id, pet_id, caption, ts FROM keepsakes ORDER BY ts DESC"
-  pure (map toKeepsake rows)
-
--- | The observation ids that have a keepsake. A kept moment's media belongs to pet-report,
--- never expires and survives GC, so the view layer reads this set to suppress the
--- clip-expiry countdown and mark the card. Keepsakes are few, so an unfiltered read is
--- cheap.
-keptObsIds :: Handle -> IO [Int64]
-keptObsIds h = withConn h $ \c ->
-  map fromOnly <$> query_ c "SELECT DISTINCT obs_id FROM keepsakes"
-
--- | The @(camera, POSIX-second)@ stamps of kept periodic-sample moments. A sample's proof
--- frame is pet-report's own media, so 'pruneProof' skips these and a kept sample stays
--- durable.
-keptSampleStamps :: Handle -> IO [(Text, Integer)]
-keptSampleStamps h = withConn h $ \c -> do
-  rows <-
-    query_
-      c
-      "SELECT o.camera, o.ts FROM observations o \
-      \JOIN keepsakes k ON k.obs_id = o.id WHERE o.source = 'sample'" ::
-      IO [(Text, Double)]
-  pure [(cam, round ts) | (cam, ts) <- rows]
-
--- | Decode a keepsakes row into a 'Keepsake', converting the stored POSIX seconds to
--- 'UTCTime'. Both 'listKeepsakes' and the read-back in 'insertKeepsake' go through here.
-toKeepsake :: (Int64, Int64, Maybe Text, Maybe Text, Double) -> Keepsake
-toKeepsake (i, o, p, cap, ts) =
-  Keepsake i o p cap (fromPosix ts)
-
--- | Delete a keepsake by id, returning the observation id it referenced when there was one,
--- so the caller can free that moment's owned media on un-keep.
-deleteKeepsake :: Handle -> Int64 -> IO (Maybe Int64)
-deleteKeepsake h i = withConn h $ \c -> withImmediateTransaction c $ do
-  rows <- query c "SELECT obs_id FROM keepsakes WHERE id = ?" (Only i) :: IO [Only Int64]
-  execute c "DELETE FROM keepsakes WHERE id = ?" (Only i)
-  pure (fromOnly <$> listToMaybe rows)
-
--- --------------------------------------------------------------------------- --
--- Per-pet weekly summaries (cached model output)
--- --------------------------------------------------------------------------- --
-
--- | The cached deterministic wellbeing verdict, the model-written one-line recap, and a few
--- stat pairs. The wellbeing line shown to the owner is derived from real signals, not
--- free text.
-data PetSummary = PetSummary
-  { sumKind  :: WellbeingKind
-  , sumRecap :: Maybe Text
-  , sumStats :: [(Text, Text)]
-  }
-  deriving stock (Eq, Show, Generic)
-
-getPetSummary :: Handle -> Text -> IO (Maybe PetSummary)
-getPetSummary h pid = withConn h $ \c -> do
-  rows <-
-    query
-      c
-      "SELECT wellbeing_kind, recap_line, stats \
-      \FROM pet_summaries WHERE pet_id = ?"
-      (Only pid)
-  pure $ case rows of
-    -- The wellbeing_kind column is a TEXT "good" or "watch". Parse it back into the sum
-    -- here, tolerantly, since the cache is regenerable.
-    ((k, rl, st) : _) -> Just (PetSummary (wellbeingKindFromText k) rl (decodeStats st))
-    _                 -> Nothing
-  where
-    decodeStats t = fromMaybe [] (decodeStrict (encodeUtf8 t))
-
-putPetSummary :: Handle -> Text -> UTCTime -> PetSummary -> IO ()
-putPetSummary h pid now s = withConn h $ \c ->
-  execute
-    c
-    "INSERT INTO pet_summaries \
-    \(pet_id, wellbeing_kind, recap_line, stats, ts) \
-    \VALUES (?, ?, ?, ?, ?) \
-    \ON CONFLICT(pet_id) DO UPDATE SET \
-    \wellbeing_kind = excluded.wellbeing_kind, \
-    \recap_line = excluded.recap_line, \
-    \stats = excluded.stats, ts = excluded.ts"
-    ( pid
-    , wellbeingKindText (sumKind s)
-    , sumRecap s
-    , TL.toStrict (encodeToLazyText (sumStats s))
-    , posixOf now
-    )
+editObservation :: Handle -> Int64 -> Int -> SceneEdit -> IO Bool
+editObservation h oid ix e = updateSighting h oid ix (applyEditAt ix e)

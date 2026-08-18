@@ -297,28 +297,26 @@ petById roster pid = find ((== pid) . petId) roster
 activePets :: Profile -> [Pet]
 activePets = filter (isNothing . petArchivedAt) . pets
 
--- | The already-decoded target of an owner correction; exactly one field is meant to be
--- set. The web layer decodes its DTO into this, keeping the aeson wrapper out of plain
--- roster logic.
-data CorrectionTarget = CorrectionTarget
-  { ctPetId    :: Maybe Text
-  , ctSpecies  :: Maybe Text
-  , ctPerson   :: Maybe Bool
-  , ctVisiting :: Maybe Bool
-  }
+-- | The already-decoded target of an owner correction: exactly one of four things. A sum
+-- rather than four nullable fields, so "this is Mochi and also a visitor and also a person"
+-- cannot be expressed and then silently resolved by a precedence chain. The web layer
+-- decodes its DTO into this, keeping the aeson wrapper out of plain roster logic.
+data CorrectionTarget
+  = TargetPet Text
+  | TargetSpecies Text
+  | TargetPerson
+  | TargetVisiting
   deriving stock (Eq, Show)
 
--- | Resolve an owner correction target against the roster, in precedence order: a visiting
--- animal, then a person, then a specific pet, then a species. Attributing to the individual
--- rather than the species is what lets a two-cat household fix one sighting, so a pet id
--- absent from the roster falls through to the species rather than naming a phantom pet. An
--- all-unset target resolves to 'Nothing'.
+-- | Resolve an owner correction target against the roster. Only 'TargetPet' can fail, and
+-- it fails loudly: naming a pet the roster does not hold is a caller error, so it is
+-- rejected rather than quietly demoted to the species. That demotion used to turn a typo
+-- into a correction the owner never asked for.
 resolveCorrection :: Roster -> CorrectionTarget -> Maybe Correction
-resolveCorrection roster ct
-  | ctVisiting ct == Just True = Just ToVisiting
-  | ctPerson ct == Just True = Just ToPerson
-  | Just pid <- ctPetId ct
-  , any ((== PetId pid) . petId) roster =
-      Just (ToPet (PetId pid))
-  | Just s <- ctSpecies ct = Just (ToSpecies (Species s))
-  | otherwise = Nothing
+resolveCorrection roster t = case t of
+  TargetVisiting -> Just ToVisiting
+  TargetPerson -> Just ToPerson
+  TargetSpecies s -> Just (ToSpecies (Species s))
+  TargetPet pid
+    | any ((== PetId pid) . petId) roster -> Just (ToPet (PetId pid))
+    | otherwise -> Nothing

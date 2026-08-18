@@ -1,8 +1,15 @@
--- | Pure per-subject aggregation over observations: sightings, rest/active
--- split, and behaviour counts, keyed by resolved identity. Exact per-pet
--- attribution because each appearance is credited to its own subject.
+-- | Pure derivations over observations. Two groups: per-subject aggregation (sightings,
+-- rest/active split, behaviour counts, keyed by resolved identity, exact per-pet because
+-- each appearance is credited to its own subject), and the per-moment signals a card and
+-- the derived @observations@ columns both read: 'wellbeingOf', 'confidenceOf',
+-- 'isUncertain', 'isConcerning' and 'needsLook'.
+--
+-- The signals live here rather than beside their readers so a rule has one definition. When
+-- the card and the stored column each carried their own copy, they drifted.
 module PetReport.Domain.Stats
   ( SubjectKey (..)
+  , ResolvedStats (..)
+  , StoredStats (..)
   , keyOf
   , PetStat (..)
   , emptyPetStat
@@ -15,7 +22,12 @@ module PetReport.Domain.Stats
   , homePresence
   , SubjectFact (..)
   , factsOf
+  , wellbeingOf
+  , confidenceOf
+  , concerningAppearance
   , isUncertain
+  , isConcerning
+  , needsLook
   ) where
 
 import           Data.Map.Strict              (Map)
@@ -27,7 +39,8 @@ import           PetReport.Domain.Behavior    (Behaviors (..),
                                                injurySuspected)
 import           PetReport.Domain.Observation (Observation (..))
 import           PetReport.Domain.Perception  (Appearance (..), Perception (..),
-                                               Scene (..), animalSpecies, isPerson)
+                                               Scene (..), animalSpecies, isPerson,
+                                               isSafetySound)
 import           PetReport.Domain.Profile     (Identity (..), Overrides, Pet (..),
                                                Roster, identifyWith)
 import           PetReport.Domain.Types       (Activity (..), ObsId (..), PetId,
@@ -44,6 +57,22 @@ data SubjectKey
   | KVisitor Species
   | KPerson
   deriving stock (Eq, Ord, Show)
+
+-- | Per-subject stats with identity ALREADY resolved against the roster: a lone cat's
+-- sightings sit under 'KPet', and 'KSpecies' holds only genuinely ambiguous ones.
+newtype ResolvedStats = ResolvedStats {resolvedStatsMap :: Map SubjectKey PetStat}
+  deriving stock (Eq, Show)
+
+-- | Per-subject stats exactly as the projection stores them: species-level unless the
+-- owner overrode a sighting, so a lone pet's sightings sit under 'KSpecies' and have to be
+-- folded in by 'PetReport.Domain.PetReport.petStatFor' before they can be read per pet.
+--
+-- Distinct from 'ResolvedStats' because the two are NOT interchangeable and used to share
+-- one type, so nothing stopped a caller reading a stored map as though it were resolved.
+-- One did: the day-stats endpoint labelled a lone pet's sightings with its species while
+-- every other surface named the pet.
+newtype StoredStats = StoredStats {storedStatsMap :: Map SubjectKey PetStat}
+  deriving stock (Eq, Show)
 
 keyOf :: Identity -> SubjectKey
 keyOf i = case i of
@@ -112,7 +141,7 @@ statOf ap =
         , psPlayed = ind (played b)
         , psGroomed = ind (groomed b)
         , psEliminated = ind (eliminatedHere b)
-        , psConcerns = ind (not (null (concerns b)) || accidentSuspected b || injurySuspected b)
+        , psConcerns = ind (concerningAppearance ap)
         }
   where
     eliminatedHere bs = case eliminated bs of
@@ -169,16 +198,59 @@ factsOf (Seen sc) = map mk (appearances sc)
             }
 factsOf (Heard _) = []
 
--- | The needs-a-look signal: an unsure scene, or one whose confidence sits below the review
--- threshold. A sound is never uncertain, carrying neither wellbeing nor confidence.
+-- | The wellbeing a moment's card carries: a scene reports its own, a safety sound reads as
+-- 'Concerning', and any other sound has nothing to say.
 --
--- Both the presentation view ('PetReport.Domain.View.viewOf') and the
--- @observations.uncertain@ column read this one rule, so a moment flagged in the column is
--- flagged on the card.
+-- One rule, two readers: the card's label and 'isConcerning' behind the review backlog.
+-- Spelling it out separately in each is how the "N to check" badge came to count moments the
+-- backlog did not hold.
+wellbeingOf :: Perception -> Maybe Wellbeing
+wellbeingOf (Seen sc)  = Just (wellbeing sc)
+wellbeingOf (Heard sk) = if isSafetySound sk then Just Concerning else Nothing
+
+-- | The confidence a moment carries: a scene's own, and none for a sound.
+--
+-- Read by the card and by the @observations.confidence@ column alike. It takes the scene's
+-- own value rather than the first projected fact, so an empty room keeps the confidence the
+-- model gave it: 'factsOf' has no row to carry one when nothing was visible.
+confidenceOf :: Perception -> Maybe Double
+confidenceOf (Seen sc) = confidenceValue <$> confidence sc
+confidenceOf (Heard _) = Nothing
+
+-- | Whether the model was unsure of a moment: it said so outright, or its confidence sits
+-- below the review threshold. A sound is never uncertain, carrying neither.
+--
+-- This is only the card's "not fully sure" mark. What reaches the review backlog is
+-- 'needsLook', which is wider.
 isUncertain :: Perception -> Bool
-isUncertain (Seen sc) =
-  wellbeing sc == Unsure || maybe False ((< 0.62) . confidenceValue) (confidence sc)
-isUncertain (Heard _) = False
+isUncertain p = wellbeingOf p == Just Unsure || maybe False (< 0.62) (confidenceOf p)
+
+-- | Whether one appearance carries a health signal worth a look: a recorded concern, a
+-- suspected injury, or an indoor accident.
+--
+-- Counted per appearance by 'statOf' and read whole-moment by
+-- 'PetReport.Pipeline.concerningObs', which is why it is named rather than spelled out at
+-- each site.
+concerningAppearance :: Appearance -> Bool
+concerningAppearance ap =
+  let b = behaviors ap
+   in not (null (concerns b)) || accidentSuspected b || injurySuspected b
+
+-- | Flagged concerning, by the same rule that labels the card.
+--
+-- Narrower than 'PetReport.Pipeline.concerningObs', which also counts per-appearance health
+-- signals when deciding whether a whole day earns an alert.
+isConcerning :: Perception -> Bool
+isConcerning p = wellbeingOf p == Just Concerning
+
+-- | The needs-a-look rule: the model was unsure, or the moment is flagged concerning. Two
+-- separate reasons to look, and a safety sound shows why both are needed: it carries no
+-- confidence to be unsure about, yet it is the thing an owner most wants surfaced.
+--
+-- Both the card ('PetReport.Domain.View.ovNeedsReview') and the @observations.needs_look@
+-- column read this one rule, so a moment queued in the column is queued on the card.
+needsLook :: Perception -> Bool
+needsLook p = isUncertain p || isConcerning p
 
 -- | The visible appearances of an observation (empty for audio).
 appearancesOf :: Observation -> [Appearance]
@@ -205,8 +277,9 @@ subjectAppearances ov roster key obs =
   [ap | (idn, ap) <- identifiedAppearances ov roster obs, keyOf idn == key]
 
 -- | Per-subject stats over a set of observations, honouring owner overrides.
-presence :: Overrides -> Roster -> [Observation] -> Map SubjectKey PetStat
+presence :: Overrides -> Roster -> [Observation] -> ResolvedStats
 presence ov roster obss =
+  ResolvedStats $
   Map.fromListWith
     (<>)
     [ (keyOf idn, statOf ap)

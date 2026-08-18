@@ -2,7 +2,7 @@
   import Thumb from './Thumb.svelte'
   import Chip from './Chip.svelte'
   import WellbeingDot from './WellbeingDot.svelte'
-  import { api, type ObsView, type Pet } from './api'
+  import { api, type AddSightingReq, type ObsView, type Pet } from './api'
   import { fmtWhen, friendlyError, serverMessage, BEHAVIOUR_FLAGS, type BehaviourFlag } from './ui'
 
   let {
@@ -25,27 +25,37 @@
     onchanged: () => void
   } = $props()
 
+  // A locally refreshed copy of the moment. Adding or removing a subject changes the
+  // sighting list and can renumber it, so the card has to re-read rather than keep showing
+  // what the parent handed it. Cleared whenever the lightbox moves to another moment.
+  let fresh = $state<ObsView | null>(null)
+  $effect(() => {
+    obs.id
+    fresh = null
+  })
+  let view = $derived(fresh ?? obs)
+
   let note = $state('')
   let busy = $state(false)
 
   let confirmDel = $state(false)
 
-  // The reviewed state is the persisted obs.reviewed, with a session override so a
+  // The reviewed state is the persisted view.reviewed, with a session override so a
   // just-reviewed or just-undone moment updates instantly (the viewer works off a
   // snapshot that is not refreshed in place). `actedMsg` shows what it was set to;
   // `kept` tracks a saved keepsake so it too can be undone.
   let reviewedOverride = $state<boolean | null>(null)
   let actedMsg = $state('')
   let kept = $state<number | null>(null)
-  let isReviewed = $derived(reviewedOverride ?? obs.reviewed)
+  let isReviewed = $derived(reviewedOverride ?? view.reviewed)
   // Kept either when opened (server flag) or just now (session id). A kept moment is
   // owned by pet-report, so it shows no clip-expiry countdown.
-  let isKept = $derived(obs.kept || kept !== null)
+  let isKept = $derived(view.kept || kept !== null)
   // Whole days until Frigate is expected to prune this moment's borrowed footage, or
   // null when kept, unknown, or already gone.
   let daysLeft = $derived.by(() => {
-    if (isKept || !obs.clipExpiresAt) return null
-    return Math.ceil((new Date(obs.clipExpiresAt).getTime() - Date.now()) / 86400000)
+    if (isKept || !view.clipExpiresAt) return null
+    return Math.ceil((new Date(view.clipExpiresAt).getTime() - Date.now()) / 86400000)
   })
 
   // Transcription of a sound event (seeded from any cached transcript, then
@@ -72,13 +82,13 @@
     'sleeping', 'resting', 'sitting', 'standing', 'walking', 'running', 'jumping',
     'playing', 'eating', 'drinking', 'grooming', 'eliminating', 'alert', 'absent', 'unclear',
   ]
-  const hasChip = (l: string) => obs.chips.some((c) => c.label === l)
+  const hasChip = (l: string) => view.chips.some((c) => c.label === l)
 
   function seedEdit() {
-    eActivity = obs.activity ?? 'unclear'
-    eWellbeing = obs.wellbeing === 'none' ? 'normal' : obs.wellbeing
-    eDesc = obs.description ?? ''
-    eWhere = obs.location ?? ''
+    eActivity = view.activity ?? 'unclear'
+    eWellbeing = view.wellbeing === 'none' ? 'normal' : view.wellbeing
+    eDesc = view.description ?? ''
+    eWhere = view.location ?? ''
     for (const f of BEHAVIOUR_FLAGS) flags[f.key] = hasChip(f.key)
   }
 
@@ -88,14 +98,14 @@
 
   // Reset the transient note + edit panel and re-seed whenever the moment changes.
   $effect(() => {
-    obs.id
+    view.id
     note = ''
     editing = false
     confirmDel = false
     reviewedOverride = null
     actedMsg = ''
     kept = null
-    transcript = obs.transcript ?? ''
+    transcript = view.transcript ?? ''
     transcribeErr = ''
     mediaBroken = false
     seedEdit()
@@ -129,27 +139,69 @@
 
   // A review/correction settles the moment: mark it reviewed and note what it was
   // set to. Undo reverts to the model's original reading and re-flags it.
-  const act = (fn: () => Promise<unknown>, message: string) =>
+  const act = (fn: () => Promise<unknown>, message: string, after?: () => void) =>
     busyDo(async () => {
       await fn()
       reviewedOverride = true
       actedMsg = message
+      after?.()
     })
+
+  // A structural change re-reads the moment, because the sighting list it renders has
+  // moved: a removal renumbers everything after it. onchanged() also tells the screen
+  // underneath, so its card agrees once the lightbox closes.
+  const structural = (fn: () => Promise<unknown>, message: string, after?: () => void) =>
+    act(
+      async () => {
+        await fn()
+        fresh = await api.moment(view.id)
+        onchanged()
+      },
+      message,
+      after,
+    )
   const undoReview = () =>
     busyDo(async () => {
-      await api.revert(obs.id)
+      await api.revert(view.id)
       reviewedOverride = false
       actedMsg = ''
     })
-  const confirmOk = () => act(() => api.review([obs.id]), 'Confirmed.')
+  const confirmOk = () => act(() => api.review([view.id]), 'Confirmed.')
+
+  // Which sighting the corrections and the edit apply to. A moment holding two cats and a
+  // sitter is three sightings, and each carries its own identity, so naming one must not
+  // touch the others. Defaults to the first animal, which is the whole story for the
+  // single-subject moment that most of them are.
+  let subjectIx = $state(0)
+  $effect(() => {
+    // Re-seed whenever the moment changes, preferring an animal over a person.
+    view.id
+    const firstAnimal = view.subjects.find((s) => !s.person)
+    subjectIx = firstAnimal?.ix ?? view.subjects[0]?.ix ?? 0
+  })
+  let subjectName = $derived(view.subjects.find((s) => s.ix === subjectIx)?.label ?? 'this one')
+
+  // Adding a subject the model missed, and removing one it invented. Both reload the
+  // moment, since the server may renumber the sightings.
+  let addingSubject = $state(false)
+  // The species worth offering: the household's own, plus cat and dog as the common
+  // strays, deduplicated.
+  let speciesChoices = $derived([...new Set([...pets.map((p) => p.petSpecies), 'cat', 'dog'])])
+  const addSubject = (req: AddSightingReq) =>
+    structural(() => api.addSighting(view.id, req), 'Added.', () => (addingSubject = false))
+  const dropSubject = (ix: number) => structural(() => api.removeSighting(view.id, ix), 'Removed.')
+
+  // Naming a subject changes the label the list above shows, so these re-read too.
   const reclass = (petId: string, name: string) =>
-    act(() => api.correct(obs.id, { petId }), `Marked as ${name}.`)
-  const asVisitor = () => act(() => api.correct(obs.id, { visiting: true }), 'Marked as a visitor.')
-  const asPerson = () => act(() => api.correct(obs.id, { person: true }), 'Marked as a person.')
-  const remove = () => run(() => api.del(obs.id), 'Deleted.', true)
+    structural(() => api.correct(view.id, subjectIx, { kind: 'pet', petId }), `Marked as ${name}.`)
+  const asVisitor = () =>
+    structural(() => api.correct(view.id, subjectIx, { kind: 'visiting' }), 'Marked as not your pet.')
+  const asPerson = () =>
+    structural(() => api.correct(view.id, subjectIx, { kind: 'person' }), 'Marked as a person.')
+  const remove = () => run(() => api.del(view.id), 'Deleted.', true)
   const keep = () =>
     busyDo(async () => {
-      const k = await api.keep(obs.id, { petId: obs.subjects[0]?.petId ?? undefined })
+      const k = await api.keep(view.id, { petId: view.subjects[0]?.petId ?? undefined })
       kept = k.id
     })
   function undoKeep() {
@@ -165,7 +217,7 @@
     transcribing = true
     transcribeErr = ''
     try {
-      transcript = (await api.transcribe(obs.id)).transcript
+      transcript = (await api.transcribe(view.id)).transcript
       onchanged() // persist into the list so the transcript survives a reopen
     } catch (e) {
       // Show Frigate's actual reason (e.g. transcription is off) rather than a generic
@@ -177,7 +229,7 @@
   }
   const saveEdit = () =>
     busyDo(async () => {
-      await api.edit(obs.id, {
+      await api.edit(view.id, subjectIx, {
         activity: eActivity,
         wellbeing: eWellbeing,
         description: eDesc,
@@ -190,11 +242,11 @@
     })
 
   const mediaLabel = $derived(
-    obs.media.kind === 'expired'
+    view.media.kind === 'expired'
       ? 'clip tidied away'
-      : obs.media.kind === 'audio'
+      : view.media.kind === 'audio'
         ? 'audio, sound only'
-        : `${obs.media.kind} · ${obs.room.toLowerCase()}`,
+        : `${view.media.kind} · ${view.room.toLowerCase()}`,
   )
 </script>
 
@@ -225,14 +277,14 @@
       class="relative mb-4 aspect-[4/3] w-full overflow-hidden rounded-[22px] lg:mb-0 lg:aspect-auto lg:h-full lg:w-full"
       style="box-shadow:0 20px 50px -10px rgba(0,0,0,0.6)"
     >
-      {#if obs.media.clipUrl && !mediaBroken}
+      {#if view.media.clipUrl && !mediaBroken}
         <!-- Only clip and audio-with-recording carry a clip URL, and a sound
              event's clip is an mp4 with a video track too, so the same player
              shows the scene and plays the audio. -->
         <!-- svelte-ignore a11y_media_has_caption -->
         <video
-          src={obs.media.clipUrl}
-          poster={obs.media.stillUrl ?? undefined}
+          src={view.media.clipUrl}
+          poster={view.media.stillUrl ?? undefined}
           controls
           playsinline
           preload="metadata"
@@ -240,16 +292,16 @@
           style="object-fit:contain;background:#12100e"
           onerror={() => (mediaBroken = true)}
         ></video>
-      {:else if obs.media.kind === 'photo' && obs.media.stillUrl && !mediaBroken}
+      {:else if view.media.kind === 'photo' && view.media.stillUrl && !mediaBroken}
         <img
-          src={obs.media.stillUrl}
+          src={view.media.stillUrl}
           alt=""
           class="absolute inset-0 h-full w-full"
           style="object-fit:contain;background:#12100e"
           onerror={() => (mediaBroken = true)}
         />
       {:else}
-        <Thumb img={obs.media.stillUrl} media={obs.media.kind} room={obs.room} pawSize={72} />
+        <Thumb img={view.media.stillUrl} media={view.media.kind} room={view.room} pawSize={72} />
         <span
           class="absolute bottom-[11px] left-[12px] rounded-[7px] px-[8px] py-[3px] font-mono"
           style="font-size:10px;color:rgba(255,246,236,0.8);background:rgba(20,14,10,0.45)"
@@ -278,29 +330,29 @@
     <!-- details pane: scrolls independently beside the media on desktop -->
     <div class="lg:w-[400px] lg:flex-shrink-0 lg:overflow-y-auto lg:pt-[2px] lg:pr-[4px]" data-scroll>
     <div class="mb-[8px] flex items-center gap-[8px]">
-      <WellbeingDot wellbeing={obs.wellbeing} size={9} />
-      <span class="font-head text-[15px] font-semibold" style="color:#f4ece3">{fmtWhen(obs.at)}</span>
+      <WellbeingDot wellbeing={view.wellbeing} size={9} />
+      <span class="font-head text-[15px] font-semibold" style="color:#f4ece3">{fmtWhen(view.at)}</span>
       <span style="color:rgba(255,246,236,0.4)">·</span>
-      <span class="text-[14px] font-semibold" style="color:rgba(255,246,236,0.7)">{obs.room}</span>
+      <span class="text-[14px] font-semibold" style="color:rgba(255,246,236,0.7)">{view.room}</span>
     </div>
 
     <div class="mb-[10px] flex flex-wrap items-center gap-[9px]">
-      <span class="font-head text-[24px] font-bold" style="color:#f4ece3">{obs.subjectLabel}</span>
-      {#if obs.activity}
+      <span class="font-head text-[24px] font-bold" style="color:#f4ece3">{view.subjectLabel}</span>
+      {#if view.activity}
         <span
           class="rounded-full px-[11px] py-[3px] text-[12px] font-bold capitalize"
-          style="color:rgba(255,246,236,0.55);background:rgba(255,246,236,0.1)">{obs.activity}</span
+          style="color:rgba(255,246,236,0.55);background:rgba(255,246,236,0.1)">{view.activity}</span
         >
       {/if}
     </div>
 
-    {#if obs.description}
+    {#if view.description}
       <div class="mb-[14px] text-[14.5px] leading-[1.55]" style="color:rgba(255,246,236,0.9)">
-        {obs.description}
+        {view.description}
       </div>
     {/if}
 
-    {#if obs.media.kind === 'audio'}
+    {#if view.media.kind === 'audio'}
       <div class="mb-[16px] rounded-[14px] px-[14px] py-[12px]" style="background:rgba(255,246,236,0.06)">
         {#if transcript}
           <div class="mb-[4px] text-[10.5px] font-extrabold tracking-wide uppercase" style="color:rgba(255,246,236,0.45)">Transcript</div>
@@ -312,15 +364,15 @@
       </div>
     {/if}
 
-    {#if obs.chips.length}
+    {#if view.chips.length}
       <div class="mb-[16px] flex flex-wrap gap-[7px]">
-        {#each obs.chips as c, i (i)}
+        {#each view.chips as c, i (i)}
           <Chip label={c.label} kind={c.kind} nowrap />
         {/each}
       </div>
     {/if}
 
-    {#if obs.uncertain && obs.confidence != null}
+    {#if view.uncertain && view.confidence != null}
       <div
         class="mb-[16px] flex items-center gap-[9px] rounded-[14px] px-[14px] py-[11px]"
         style="background:rgba(183,168,192,0.12);border:1px solid rgba(183,168,192,0.28)"
@@ -330,7 +382,7 @@
           style="background:var(--unclear)"
         ></span>
         <span class="text-[13px]" style="color:rgba(255,246,236,0.85)"
-          >I'm only <b>{Math.round(obs.confidence * 100)}%</b> sure who this is. Help me learn?</span
+          >I'm only <b>{Math.round(view.confidence * 100)}%</b> sure who this is. Help me learn?</span
         >
       </div>
     {/if}
@@ -379,7 +431,7 @@
           class="rounded-2xl px-[16px] py-[13px] text-[13.5px] font-bold disabled:opacity-50"
           style="background:rgba(163,192,143,0.2);color:var(--good)">♥ Saved · Undo</button
         >
-      {:else if obs.kept}
+      {:else if view.kept}
         <button
           disabled
           class="rounded-2xl px-[16px] py-[13px] text-[13.5px] font-bold opacity-70"
@@ -417,11 +469,43 @@
     </div>
 
     {#if !isReviewed}
+    <!-- The moment's subjects, always shown. A frame can hold a pet AND a person, so this
+         is a list you can add to and remove from, not a single choice. Tapping one selects
+         it for the correction and edit controls below. -->
     <div class="mt-3 text-[11px] font-bold tracking-wide uppercase" style="color:rgba(255,246,236,0.5)">
-      Not right? Set who it is
+      Who's in this one?
+    </div>
+    <div class="mt-2 flex flex-wrap items-center gap-[8px]">
+      {#each view.subjects as s (s.ix)}
+        <span class="inline-flex items-center gap-[6px] rounded-full px-[12px] py-[7px] text-[13px] font-bold"
+          style={s.ix === subjectIx
+            ? 'background:var(--accent);color:var(--ink)'
+            : 'background:rgba(255,246,236,0.1);color:#f4ece3'}>
+          <button onclick={() => (subjectIx = s.ix)} disabled={busy} style="border:none;background:none;padding:0;font:inherit;color:inherit;cursor:pointer">{s.label}</button>
+          <button
+            onclick={() => dropSubject(s.ix)}
+            disabled={busy}
+            title="Not actually there"
+            style="border:none;background:none;padding:0;font:inherit;color:inherit;opacity:.65;cursor:pointer">&times;</button>
+        </span>
+      {/each}
+      {#if addingSubject}
+        <span class="inline-flex flex-wrap items-center gap-[6px]">
+          <button onclick={() => addSubject({ kind: 'person' })} disabled={busy} class="rounded-full px-[12px] py-[7px] text-[13px] font-bold" style="background:rgba(255,246,236,0.1);color:#f4ece3">A person</button>
+          {#each speciesChoices as sp (sp)}
+            <button onclick={() => addSubject({ kind: 'species', species: sp })} disabled={busy} class="rounded-full px-[12px] py-[7px] text-[13px] font-bold capitalize" style="background:rgba(255,246,236,0.1);color:#f4ece3">A {sp}</button>
+          {/each}
+          <button onclick={() => (addingSubject = false)} disabled={busy} class="text-[12px] font-bold" style="border:none;background:none;color:rgba(255,246,236,0.55)">Cancel</button>
+        </span>
+      {:else}
+        <button onclick={() => (addingSubject = true)} disabled={busy} class="rounded-full px-[12px] py-[7px] text-[13px] font-bold" style="background:rgba(255,246,236,0.06);color:rgba(255,246,236,0.75);border:1px dashed rgba(255,246,236,0.25)">+ Someone else</button>
+      {/if}
+    </div>
+    <div class="mt-3 text-[11px] font-bold tracking-wide uppercase" style="color:rgba(255,246,236,0.5)">
+      {view.subjects.length > 1 ? `Not right? Set who ${subjectName} is` : 'Not right? Set who it is'}
     </div>
     <div class="mt-2 flex flex-wrap gap-[8px]">
-      {#each pets.filter((p) => !obs.subjects.some((s) => s.petId === p.petId)) as p (p.petId)}
+      {#each pets.filter((p) => !view.subjects.some((s) => s.ix === subjectIx && s.petId === p.petId)) as p (p.petId)}
         <button
           onclick={() => reclass(p.petId, p.petName)}
           disabled={busy}
@@ -433,7 +517,7 @@
         onclick={asVisitor}
         disabled={busy}
         class="rounded-full px-[14px] py-[8px] text-[13px] font-bold disabled:opacity-50"
-        style="background:rgba(255,246,236,0.1);color:#f4ece3">A visitor</button
+        style="background:rgba(255,246,236,0.1);color:#f4ece3">Not my pet</button
       >
       <button
         onclick={asPerson}
@@ -444,7 +528,7 @@
     </div>
     {/if}
 
-    {#if obs.media.kind !== 'audio'}
+    {#if view.media.kind !== 'audio'}
       <button
         onclick={() => (editing = !editing)}
         class="mt-3 w-full rounded-2xl py-[12px] text-[13px] font-bold"
@@ -482,8 +566,8 @@
               <button onclick={() => (flags[f.key] = !flags[f.key])} class="rounded-full px-[12px] py-[6px] text-[12px] font-bold" style={flagStyle(flags[f.key])}>{f.label}</button>
             {/each}
           </div>
-          {#if obs.subjects.length > 1}
-            <div class="mb-[10px] text-[11px] leading-[1.4]" style="color:rgba(255,246,236,0.5)">Activity and behaviours apply to all animals in this moment.</div>
+          {#if view.subjects.length > 1}
+            <div class="mb-[10px] text-[11px] leading-[1.4]" style="color:rgba(255,246,236,0.5)">Activity and behaviours apply to {subjectName}. The note and wellbeing cover the whole moment.</div>
           {/if}
           <button onclick={saveEdit} disabled={busy} class="w-full rounded-2xl py-[12px] text-[13.5px] font-extrabold disabled:opacity-50" style="background:var(--accent);color:var(--ink)">Save &amp; confirm</button>
           <div class="mt-[7px] text-center text-[11px]" style="color:rgba(255,246,236,0.45)">Saving also marks this moment as checked.</div>

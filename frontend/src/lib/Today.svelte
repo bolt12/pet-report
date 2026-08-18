@@ -22,7 +22,7 @@
   import { live as liveOverlay, openLive, closeLive } from './liveview.svelte'
   import { day } from './day.svelte'
   import { refreshes } from './refresh.svelte'
-  import { greeting, longDate, chipFg, roomTint, fmtTime, friendlyError, frameSrc, ymdForOffset } from './ui'
+  import { greeting, longDate, chipFg, chipStyle, roomTint, fmtTime, friendlyError, frameSrc, ymdForOffset } from './ui'
   import { toggleTheme, theme } from './theme.svelte'
   import { layout } from './layout.svelte'
   import { onDestroy } from 'svelte'
@@ -164,13 +164,48 @@
   }
 
   let obs = $derived(data?.moments ?? [])
-  let alert = $derived(day.offset === 0 && !dismissed ? obs.find((o) => o.wellbeing === 'concerning') : undefined)
-  let concerningCount = $derived(obs.filter((o) => o.wellbeing === 'concerning').length)
+  // The day's concerns still waiting on you, stated once so the heads-up and the badge cannot
+  // disagree. Both are gated on needsReview, so reviewing one drops it from both and from the
+  // list they open. The badge used to count moments no filter could retrieve, leaving it
+  // nowhere to send you.
+  //
+  // It counts a SUBSET of that list, which also holds whatever the model was unsure about.
+  // Identical today, since a missing confidence never trips the unsure threshold; they part
+  // company once confidence is populated, and the honest fix then is a concerning facet in
+  // Review rather than a looser count here.
+  // The badge's count and the query its link opens, defined once. The count filters the
+  // day's loaded moments; the query asks the server for the same set. Previously the link
+  // fell back to the needs-a-look backlog, a strict superset of what the badge counted, so
+  // the list was reliably longer than the number that opened it.
+  let concerningQuery = $derived<ReviewPreset>({
+    from: ymdForOffset(day.offset),
+    to: ymdForOffset(day.offset),
+    wellbeing: 'concerning',
+    review: 'unreviewed',
+  })
+  let concerning = $derived(obs.filter((o) => o.wellbeing === 'concerning' && o.needsReview))
+  // Likewise for the presence note. This is the link that used to carry a fabricated pet
+  // id of 'visitor' and land on an empty page.
+  let personQuery = $derived<ReviewPreset>({
+    from: ymdForOffset(day.offset),
+    to: ymdForOffset(day.offset),
+    subject: [{ kind: 'person' }],
+  })
+  let alert = $derived(day.offset === 0 && !dismissed ? concerning[0] : undefined)
+  let concerningCount = $derived(concerning.length)
   let live = $derived(overview?.cameras ?? [])
-  // The badge counts only the moments this day holds that the model is unsure about, the
-  // same day-scoped rule for today and any past day (contract D1). It used to show the
-  // global backlog on today, so one old uncertain moment read as if today had one to review.
+  // The moments this day holds that are still queued: ones the model was unsure about, plus
+  // ones flagged concerning. The same day-scoped rule for today and any past day (contract
+  // D1). It used to show the global backlog on today, so one old moment read as if today had
+  // one to review.
   let needsCount = $derived(obs.filter((o) => o.needsReview).length)
+  // The review nudge counts this day's flagged-or-unsure moments, so its link says the
+  // same thing: the needs-a-look backlog scoped to the day in view.
+  let needsQuery = $derived<ReviewPreset>({
+    from: ymdForOffset(day.offset),
+    to: ymdForOffset(day.offset),
+    review: 'needs-look',
+  })
 
   // Cache-busting tick for the "Right now" stills, so they refresh instead of freezing on
   // the first frame. Runs only while those tiles are shown (today, with cameras) and pauses
@@ -217,7 +252,7 @@
     <div class="mb-[11px] flex items-center justify-between gap-[8px]">
       <div class="flex items-center gap-[8px]"><span class="h-[8px] w-[8px] rounded-full" style="background:var(--accent);box-shadow:0 0 12px var(--accent)"></span><span class="font-head text-[16px] font-semibold" style="color:var(--text)">{day.offset === 0 ? 'Today so far' : 'Summary'}</span></div>
       {#if concerningCount > 0}
-        <span class="rounded-full px-[11px] py-[5px] text-[11.5px] font-extrabold" style="background:rgba(236,177,99,0.16);color:var(--watch)">{concerningCount} to check</span>
+        <button onclick={() => onnav('review', concerningQuery)} class="tappable rounded-full px-[11px] py-[5px] text-[11.5px] font-extrabold" style="{chipStyle('watch')};border:none">{concerningCount} to check ›</button>
       {:else if obs.length === 0}
         <span class="rounded-full px-[11px] py-[5px] text-[11.5px] font-extrabold" style="background:rgba(255,246,236,0.06);color:var(--muted)">Nothing captured</span>
       {:else}
@@ -226,7 +261,7 @@
     </div>
     <div class="relative text-[15px] leading-[1.55]" style="color:var(--text);opacity:.92"><TimeText text={data?.narrative ?? 'No summary yet for this day. The cameras are often off, so a quiet log is perfectly normal.'} date={ymdForOffset(day.offset)} {onnav} /></div>
     {#if data?.presence?.someoneHome}
-      <button onclick={() => onnav('review', 'visitor')} class="mt-[11px] inline-flex items-center gap-[6px] text-[12px] font-semibold" style="background:none;border:none;padding:0;color:var(--muted)"><span style="opacity:.7">⌂</span> Someone was home {day.offset === 0 ? 'today' : 'that day'} <span style="color:var(--accent)">›</span></button>
+      <button onclick={() => onnav('review', personQuery)} class="mt-[11px] inline-flex items-center gap-[6px] text-[12px] font-semibold" style="background:none;border:none;padding:0;color:var(--muted)"><span style="opacity:.7">⌂</span> Someone was home {day.offset === 0 ? 'today' : 'that day'} <span style="color:var(--accent)">›</span></button>
     {/if}
     <div class="mt-[15px] flex flex-wrap gap-[9px]">
       <button onclick={refresh} disabled={refreshing} class="inline-flex items-center gap-[7px] rounded-full px-[16px] py-[9px] text-[13px] font-extrabold whitespace-nowrap disabled:opacity-70" style="background:var(--accent);color:var(--ink);border:none"><span style="display:inline-block;{refreshing ? 'animation:petSpin .9s linear infinite' : ''}">↻</span> {refreshing ? 'Looking...' : refreshed ? 'Just updated' : 'Refresh'}</button>
@@ -336,9 +371,9 @@
 
 {#snippet needsNudge()}
   <!-- needs a look nudge -->
-  <button onclick={() => onnav('review', needsCount > 0 ? 'needs' : undefined)} class="tappable mb-[16px] flex w-full items-center gap-[12px] rounded-[20px] p-[14px_15px] text-left" style="background:{needsCount > 0 ? 'rgba(236,177,99,0.1)' : 'rgba(163,192,143,0.1)'};border:1px solid {needsCount > 0 ? 'rgba(236,177,99,0.3)' : 'rgba(163,192,143,0.28)'};color:inherit">
+  <button onclick={() => onnav('review', needsCount > 0 ? needsQuery : undefined)} class="tappable mb-[16px] flex w-full items-center gap-[12px] rounded-[20px] p-[14px_15px] text-left" style="background:{needsCount > 0 ? 'rgba(236,177,99,0.1)' : 'rgba(163,192,143,0.1)'};border:1px solid {needsCount > 0 ? 'rgba(236,177,99,0.3)' : 'rgba(163,192,143,0.28)'};color:inherit">
     <span class="flex h-[38px] w-[38px] flex-shrink-0 items-center justify-center rounded-xl" style="background:{needsCount > 0 ? 'var(--watch)' : 'var(--good)'};color:{needsCount > 0 ? '#3a2a10' : '#1f3018'}">{#if needsCount > 0}<Paw size={20} />{:else}<span class="text-[17px] font-black">✓</span>{/if}</span>
-    <div class="min-w-0 flex-1"><div class="font-head text-[15.5px] font-semibold" style="color:var(--text)">{needsCount > 0 ? `${needsCount} moment${needsCount === 1 ? '' : 's'} to review` : 'All caught up'}</div><div class="mt-[1px] text-[12px]" style="color:var(--muted)">{needsCount > 0 ? "A few I'm not sure about, tap to take a look" : `Nothing needs your eyes ${day.offset === 0 ? 'today' : 'that day'}`}</div></div>
+    <div class="min-w-0 flex-1"><div class="font-head text-[15.5px] font-semibold" style="color:var(--text)">{needsCount > 0 ? `${needsCount} moment${needsCount === 1 ? '' : 's'} to review` : 'All caught up'}</div><div class="mt-[1px] text-[12px]" style="color:var(--muted)">{needsCount > 0 ? "A few I flagged or wasn't sure about, tap to take a look" : `Nothing needs your eyes ${day.offset === 0 ? 'today' : 'that day'}`}</div></div>
     <span class="flex-shrink-0 text-[19px]" style="color:var(--faint)">›</span>
   </button>
 {/snippet}

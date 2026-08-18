@@ -31,17 +31,17 @@ import           Servant                (Handler)
 import           PetReport.App                (App (..), appRetention)
 import           PetReport.Domain.Observation (Observation)
 import           PetReport.Domain.Profile     (Overrides, Pet (..), Profile (..),
-                                               petById)
+                                               petById, uniquePetOfSpecies)
 import           PetReport.Domain.Stats       (PetStat (..), SubjectKey (..),
-                                               homePresence)
+                                               homePresence, storedStatsMap)
 import           PetReport.Domain.Types       (ObsId (..), petIdText, speciesText)
-import           PetReport.Domain.View        (ObsView, RetentionMap, mkViews)
+import           PetReport.Domain.View        (ObsView, RetentionMap, mkViews,
+                                               proofRetainDays)
 import           PetReport.Domain.Window      (Window (..), dayKeyText, localDayOf)
 import qualified PetReport.Effect.Clock       as Clock
 import qualified PetReport.Effect.Db          as Db
 import           PetReport.Error              (AppError (..), badInput, notFound,
                                                throwAppError)
-import qualified PetReport.Pipeline           as Pipeline
 import           PetReport.Trace              (WebEvent (..), traceWith, webTracer)
 import           PetReport.Util               (trySync)
 import           PetReport.Web.Types          (DayStat (..), OkResp (..), PresenceV,
@@ -83,7 +83,7 @@ viewCtx app = do
 buildObsViews :: App -> UTCTime -> Profile -> Map.Map ObsId Text -> Overrides -> [Observation] -> IO [ObsView]
 buildObsViews app now prof transcripts ov obss = do
   (retention, kept) <- viewCtx app
-  pure (mkViews Pipeline.proofRetainDays retention kept now transcripts prof ov obss)
+  pure (mkViews proofRetainDays retention kept now transcripts prof ov obss)
 
 -- | Per-pet stats for the selected day. Labels resolve via the full roster, so an archived
 -- pet keeps its name, and an unattributed sighting is labelled by species.
@@ -95,10 +95,10 @@ dayStatsFor app tz prof w = do
   -- construction, so the two agree while both are available.
   live <- Db.subjectStatsBetween (appDb app) (winFrom w) (winTo w)
   stats <-
-    if Map.null live
+    if Map.null (storedStatsMap live)
       then Db.dailyPetStats (appDb app) (dayKeyText (localDayOf tz (winFrom w)))
       else pure live
-  pure (map (toDayStat (pets prof)) (Map.toList stats))
+  pure (map (toDayStat (pets prof)) (Map.toList (storedStatsMap stats)))
 
 toDayStat :: [Pet] -> (SubjectKey, PetStat) -> DayStat
 toDayStat roster (key, ps) =
@@ -113,7 +113,13 @@ toDayStat roster (key, ps) =
             , maybe "" (speciesText . petSpecies) mp
             , maybe (petIdText pid) petName mp
             )
-      KSpecies sp -> (Nothing, speciesText sp, speciesText sp)
+      -- Stored stats are species-level unless the owner overrode a sighting, so resolve
+      -- the same way every other surface does: when exactly one active pet has this
+      -- species, these sightings are that pet's. Without this the day view labelled a
+      -- lone pet's moments "cat" while the pet dashboard called them "Miso".
+      KSpecies sp -> case uniquePetOfSpecies roster sp of
+        Just p  -> (Just (petIdText (petId p)), speciesText sp, petName p)
+        Nothing -> (Nothing, speciesText sp, speciesText sp)
       -- Both the rollup and subjectStatsBetween exclude visitors and persons, so these
       -- arms are unreachable. Label them anyway rather than leave the match partial.
       KVisitor sp -> (Nothing, speciesText sp, speciesText sp)

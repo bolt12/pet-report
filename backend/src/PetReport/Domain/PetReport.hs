@@ -35,7 +35,6 @@ module PetReport.Domain.PetReport
 import           Data.Aeson          (ToJSON (..), genericToJSON)
 import           Data.Int            (Int64)
 import           Data.List           (sortOn)
-import           Data.Map.Strict     (Map)
 import qualified Data.Map.Strict     as Map
 import qualified Data.Set            as Set
 import           Data.Maybe          (fromMaybe, isNothing, listToMaybe)
@@ -51,12 +50,13 @@ import           PetReport.Domain.Perception  (Appearance (..))
 import           PetReport.Domain.Profile     (CameraRoom, Overrides, Pet (..),
                                                Roster, roomOf,
                                                uniquePetOfSpecies)
-import           PetReport.Domain.Stats       (PetStat (..), SubjectKey (..),
+import           PetReport.Domain.Stats       (resolvedStatsMap, StoredStats (..), PetStat (..), SubjectKey (..),
                                                emptyPetStat, statOf,
                                                subjectAppearances)
 import           PetReport.Domain.Trends      (DayTrend (..), trends)
 import           PetReport.Domain.Types       (ObsId (..), PetId, activityText,
-                                               petIdText, speciesText)
+                                               cameraText, petIdText,
+                                               speciesText)
 import           PetReport.Domain.View        (Chip (..), ChipKind (..))
 import           PetReport.Util               (capitalize, prefixed, tshow)
 
@@ -91,9 +91,19 @@ data Habit = Habit
 instance ToJSON Habit where
   toJSON = genericToJSON (prefixed 2)
 
+-- | One of a pet's favourite places: the room's display label, the cameras that label
+-- resolved from, and the share of the pet's sightings that landed there.
+--
+-- The cameras are carried because 'spRoom' is a DISPLAY label and cannot be used as a
+-- query key: 'PetReport.Domain.Profile.roomOf' falls back to a title-cased camera id when a
+-- camera is missing from the profile or its room was saved blank, and no saved room label
+-- ever equals that. A link built from the label alone therefore filtered on a room nobody
+-- had, and opened nothing. Linking on the camera ids the spot actually counted makes the
+-- number and the list agree whatever the label says.
 data Spot = Spot
-  { spRoom :: Text
-  , spPct  :: Int
+  { spRoom    :: Text
+  , spCameras :: [Text]
+  , spPct     :: Int
   }
   deriving stock (Eq, Show, Generic)
 
@@ -274,7 +284,7 @@ insightsFor tz ov crs roster now pet weekObs =
 insightsFrom :: TZ -> Overrides -> [CameraRoom] -> Roster -> [DayTrend] -> Pet -> [Observation] -> PetInsights
 insightsFrom tz ov crs roster ds pet weekObs =
   let key = KPet (petId pet)
-      weekStats = [Map.findWithDefault emptyPetStat key (dtStats dt) | dt <- ds]
+      weekStats = [Map.findWithDefault emptyPetStat key (resolvedStatsMap (dtStats dt)) | dt <- ds]
       todayStat = if null weekStats then emptyPetStat else last weekStats
       weekTotal = foldl' (<>) emptyPetStat weekStats
       seen = psSightings todayStat
@@ -290,7 +300,7 @@ insightsFrom tz ov crs roster ds pet weekObs =
         | otherwise = Nothing
       kind = maybe Settled (const Flagged) mwatch
       rmDist = roomDistribution crs ov roster (petId pet) weekObs
-      total = max 1 (sum (map snd rmDist))
+      total = max 1 (sum [n | (_, _, n) <- rmDist])
    in PetInsights
         { piId = petIdText (petId pet)
         , piName = petName pet
@@ -309,7 +319,7 @@ insightsFrom tz ov crs roster ds pet weekObs =
         , piRhythm = hourHistogram tz ov key roster weekObs
         , piRhythmMarks = mealMarks tz ov key roster weekObs
         , piBalance = balanceFor weekTotal
-        , piSpots = [Spot r (pct c total) | (r, c) <- take 4 rmDist]
+        , piSpots = [Spot r cams (pct c total) | (r, cams, c) <- take 4 rmDist]
         , piWellbeing = WellbeingV kind Nothing
         , piLastSeen = lastSeenFor tz ov crs roster key weekObs
         , piRecap = Nothing
@@ -421,14 +431,23 @@ mealMarks tz ov key roster obss =
     , psAte s > 0 || psDrank s > 0
     ]
 
--- | Room distribution for one pet, most-frequent first.
-roomDistribution :: [CameraRoom] -> Overrides -> Roster -> PetId -> [Observation] -> [(Text, Int)]
+-- | Room distribution for one pet, most-frequent first, as
+-- @(display label, the cameras it covers, sightings)@.
+--
+-- Grouping is by display label, so two cameras sharing a room name merge into one row, and
+-- the cameras that merged are returned alongside. Those ids are the only part of this that
+-- a query can filter on; see 'Spot'.
+roomDistribution ::
+  [CameraRoom] -> Overrides -> Roster -> PetId -> [Observation] -> [(Text, [Text], Int)]
 roomDistribution crs ov roster pid obss =
-  sortOn (Down . snd) $
-    Map.toList $
+  [ (lbl, Set.toList cams, n)
+  | (lbl, (cams, n)) <- sortOn (Down . snd . snd) (Map.toList grouped)
+  ]
+  where
+    grouped =
       Map.fromListWith
-        (+)
-        [ (roomOf crs (camera o), 1 :: Int)
+        (\(c1, n1) (c2, n2) -> (Set.union c1 c2, n1 + n2))
+        [ (roomOf crs (camera o), (Set.singleton (cameraText (camera o)), 1 :: Int))
         | o <- obss
         , _ <- subjectAppearances ov roster (KPet pid) o
         ]
@@ -442,8 +461,8 @@ roomDistribution crs ov roster pid obss =
 -- (the @KSpecies@ bucket) when the roster makes that species unambiguous, matching
 -- 'identify'. Two pets of one species therefore each get only their reassigned sightings,
 -- while a lone pet of its species is unaffected.
-petStatFor :: Roster -> Pet -> Map SubjectKey PetStat -> Maybe PetStat
-petStatFor roster pet m =
+petStatFor :: Roster -> Pet -> StoredStats -> Maybe PetStat
+petStatFor roster pet (StoredStats m) =
   let overridden = Map.lookup (KPet (petId pet)) m
       bySpecies = case uniquePetOfSpecies roster (petSpecies pet) of
         Just p | petId p == petId pet -> Map.lookup (KSpecies (petSpecies pet)) m
@@ -474,7 +493,7 @@ monthStatFor :: [DayTrend] -> Pet -> PetStat
 monthStatFor ds pet =
   let key = KPet (petId pet)
    in foldl' (<>) emptyPetStat
-        [Map.findWithDefault emptyPetStat key (dtStats dt) | dt <- ds]
+        [Map.findWithDefault emptyPetStat key (resolvedStatsMap (dtStats dt)) | dt <- ds]
 
 -- | A compact set of month totals for the Pets screen.
 monthStatPairs :: PetStat -> [StatPair]

@@ -78,6 +78,7 @@ import           PetReport.Web.Cameras
 import           PetReport.Web.Cleanup
 import           PetReport.Web.Days
 import           PetReport.Web.Events
+import           PetReport.Web.Facets
 import           PetReport.Web.Keepsakes
 import           PetReport.Web.Moments
 import           PetReport.Web.Ops
@@ -102,16 +103,33 @@ type DaysAPI =
   "api" :> "days" :> Capture "date" Text :> Get '[JSON] DayResponse
 
 type MomentsAPI =
+       -- Every facet has its own type, so an unrecognised token is a 400 naming the legal
+       -- set rather than a silently dropped clause, and two adjacent params can no longer
+       -- be transposed without a compile error.
        "api" :> "moments"
-         :> QueryParam "from" Text      :> QueryParam "to" Text     :> QueryParam "pet" Text
-         :> QueryParam "activity" Text  :> QueryParam "room" Text   :> QueryParam "media" Text
-         :> QueryParam "timeOfDay" Text :> QueryParam "review" Text :> QueryParam "search" Text
-         :> QueryParam "sort" Text      :> QueryParam "cursor" Text :> QueryParam "limit" Int
+         :> QueryParam "from" Text           :> QueryParam "to" Text
+         :> QueryParams "subject" SubjectSel :> QueryParam "activity" ActivitySel
+         :> QueryParam "behaviour" BehaviourSel :> QueryParam "wellbeing" WellbeingSel
+         -- room is a saved label from the profile; camera is the raw id, which is what a
+         -- favourite-spot link carries because its label may be a display-only fallback.
+         :> QueryParam "room" Text           :> QueryParams "camera" Text
+         :> QueryParam "media" MediaSel
+         :> QueryParam "timeOfDay" TimeOfDaySel :> QueryParam "review" ReviewSel
+         :> QueryParam "search" Text         :> QueryParam "sort" SortSel
+         :> QueryParam "cursor" Text         :> QueryParam "limit" Int
          :> Get '[JSON] Value
   :<|> "api" :> "moments" :> "review"                            :> ReqBody '[JSON] ReviewReq :> Post '[JSON] OkResp
   :<|> "api" :> "moments" :> "delete"                            :> ReqBody '[JSON] DeleteMomentsReq :> Post '[JSON] Value
-  :<|> "api" :> "moments" :> Capture "id" Int64 :> "correction"  :> ReqBody '[JSON] CorrectReq :> Post '[JSON] OkResp
-  :<|> "api" :> "moments" :> Capture "id" Int64 :> "edit"        :> ReqBody '[JSON] EditReq :> Post '[JSON] OkResp
+  -- Both address ONE sighting: a moment holding two cats and a sitter is three sightings,
+  -- and each is named and edited on its own. The index is in the path rather than the body
+  -- so it cannot be defaulted away.
+  -- Add a subject the model missed, or drop one it invented. Together with the
+  -- per-sighting correction below, this is what lets a frame hold a pet AND a person
+  -- rather than one or the other.
+  :<|> "api" :> "moments" :> Capture "id" Int64 :> "sightings" :> ReqBody '[JSON] AddSightingReq :> Post '[JSON] OkResp
+  :<|> "api" :> "moments" :> Capture "id" Int64 :> "sightings" :> Capture "ix" Int :> Delete '[JSON] OkResp
+  :<|> "api" :> "moments" :> Capture "id" Int64 :> "sightings" :> Capture "ix" Int :> "correction" :> ReqBody '[JSON] CorrectReq :> Post '[JSON] OkResp
+  :<|> "api" :> "moments" :> Capture "id" Int64 :> "sightings" :> Capture "ix" Int :> "edit"       :> ReqBody '[JSON] EditReq :> Post '[JSON] OkResp
   :<|> "api" :> "moments" :> Capture "id" Int64 :> "revert"      :> Post '[JSON] OkResp
   :<|> "api" :> "moments" :> Capture "id" Int64 :> "keepsake"    :> ReqBody '[JSON] KeepsakeReq :> Post '[JSON] Db.Keepsake
   :<|> "api" :> "moments" :> Capture "id" Int64 :> "transcript"  :> Post '[JSON] Value
@@ -188,6 +206,8 @@ server app =
   :<|> ( momentsH app
     :<|> reviewH app
     :<|> deleteMomentsH app
+    :<|> addSightingH app
+    :<|> removeSightingH app
     :<|> correctH app
     :<|> editH app
     :<|> revertH app

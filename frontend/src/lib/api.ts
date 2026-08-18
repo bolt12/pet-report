@@ -81,9 +81,14 @@ export interface Chip {
 }
 
 export interface SubjectRef {
+  // The sighting's index within its moment. This is how a correction addresses one
+  // subject: a frame holding two cats has refs at 0 and 1, and naming one leaves the
+  // other alone.
+  ix: number
   petId: string | null
   label: string
   species: string | null
+  person: boolean
 }
 
 export type MediaKind = 'photo' | 'clip' | 'audio' | 'expired'
@@ -163,37 +168,81 @@ export interface MomentsPage {
   total?: number
 }
 
+// The vocabularies the server accepts. Unions rather than `string`, so a link built
+// from a value the server cannot parse fails to compile instead of returning an empty
+// page. The server rejects an unknown token with a 400 naming the legal set.
+// `person` is a human; `visiting` is an animal the owner marked as not theirs. They were
+// both called "visitor" in different places, which made a card saying "Visitor" impossible
+// to read: it could mean either.
+export type SubjectSel =
+  | { kind: 'pet'; petId: string }
+  | { kind: 'species'; species: string }
+  | { kind: 'person' }
+  | { kind: 'visiting' }
+
+export type ActivityValue =
+  | 'sleeping' | 'resting' | 'sitting' | 'standing' | 'walking' | 'running'
+  | 'jumping' | 'playing' | 'eating' | 'drinking' | 'grooming' | 'eliminating'
+  | 'alert' | 'absent' | 'unclear'
+
+// One per projected behaviour column. Every per-pet tile counts one of these, so a tile
+// links on the same word it counted rather than translating to a different facet.
+export type BehaviourValue =
+  | 'ate' | 'drank' | 'slept' | 'played' | 'groomed' | 'eliminated'
+  | 'rest' | 'active' | 'concern'
+
+export type WellbeingValue = 'normal' | 'concerning' | 'unclear'
+export type MediaValue = 'photo' | 'clip' | 'audio'
+export type ReviewValue = 'reviewed' | 'unreviewed' | 'needs-look'
+export type TimeOfDayValue = 'morning' | 'afternoon' | 'evening' | 'night'
+export type SortValue = 'asc' | 'desc'
+
+// Render a subject selector as the `subject` query value the server parses.
+export function subjectParam(s: SubjectSel): string {
+  switch (s.kind) {
+    case 'pet':
+      return `pet:${s.petId}`
+    case 'species':
+      return `species:${s.species}`
+    default:
+      return s.kind
+  }
+}
+
 // The facets of the moments browse, all optional (docs/api-contract.md 3.1).
 export interface MomentsQuery {
   from?: string
   to?: string
-  pet?: string
-  activity?: string
+  // Several AND together: a moment must hold every subject named. That is what makes
+  // "Mochi and a person" a question you can ask.
+  subject?: SubjectSel[]
+  activity?: ActivityValue
+  behaviour?: BehaviourValue
+  wellbeing?: WellbeingValue
   room?: string
-  media?: string
-  timeOfDay?: string
-  review?: string
+  // Raw camera ids. A favourite-spot link carries these because its room text is a
+  // display label that may not match any saved room.
+  camera?: string[]
+  media?: MediaValue
+  timeOfDay?: TimeOfDayValue
+  review?: ReviewValue
   search?: string
-  sort?: string
+  sort?: SortValue
   cursor?: string
   limit?: number
 }
 
-// A filter/date preset carried into Review, either from a quick nav ("needs a
-// look") or a deep-linked stat card (a date range + facet). `from`/`to` are ISO
-// dates that switch Review into range mode; the rest seed the facet filters.
-export interface ReviewPreset {
-  from?: string
-  to?: string
-  who?: string[]
-  act?: string[]
-  room?: string[]
-  media?: string[]
-  // A coarse time-of-day bucket (morning | afternoon | evening | night).
-  timeOfDay?: string
-  needs?: boolean
-  reviewed?: 'all' | 'reviewed' | 'unreviewed'
-}
+// What a link into Review means: the query it wants opened.
+//
+// This is a MomentsQuery minus the paging fields, deliberately, so a badge's count and the
+// list its link opens are built from ONE value rather than two pieces of code that have to
+// agree. The previous shape was a parallel set of loose string arrays (`who`, `act`) that
+// each screen translated into facets by hand, and every translation was a chance to name a
+// set the server could not answer. `who: ['visitor']` was one: it became `pet=visitor`,
+// which matched nothing.
+//
+// `from`/`to` are ISO dates that switch Review into range mode; the rest seed the facets.
+export type ReviewPreset = Omit<MomentsQuery, 'cursor' | 'limit' | 'sort' | 'search'>
 
 export interface CameraStatus {
   camera: string
@@ -219,7 +268,11 @@ export interface Habit {
   belowUsual: boolean
 }
 export interface Spot {
+  // A DISPLAY label. It may be a title-cased camera id when that camera is missing from
+  // the profile or its room was saved blank, and no saved room label ever equals that, so
+  // this must not be used as a query value. Filter on `cameras` instead.
   room: string
+  cameras: string[]
   pct: number
 }
 export interface Balance {
@@ -297,12 +350,16 @@ export interface AskAnswer {
 
 // An owner correction of a mis-identified subject (exactly one target set). The
 // moment id is in the request path.
-export interface CorrectReq {
-  petId?: string
-  species?: string
-  person?: boolean
-  visiting?: boolean
-}
+// Tagged, so "a pet and a visitor at once" cannot be expressed. The server used to take
+// four optional fields and settle any combination by precedence.
+// A subject the owner says was present but the model did not report.
+export type AddSightingReq = { kind: 'person' } | { kind: 'species'; species: string }
+
+export type CorrectReq =
+  | { kind: 'pet'; petId: string }
+  | { kind: 'species'; species: string }
+  | { kind: 'person' }
+  | { kind: 'visiting' }
 
 // The outcome of the last background batch, for an honest refresh state.
 export interface BatchOutcome {
@@ -386,20 +443,30 @@ const patch = (path: string, body: unknown, timeout = DEFAULT_TIMEOUT) =>
 const del = (path: string, timeout = DEFAULT_TIMEOUT) =>
   fetch(path, { method: 'DELETE', signal: AbortSignal.timeout(timeout) })
 
-// A query string from the present (non-empty) params, or '' when there are none.
-function qs(params: Record<string, string | number | undefined>): string {
+// A query string from the present (non-empty) params, or '' when there are none. An
+// array value repeats its key, which is how the server reads `camera`.
+function qs(params: Record<string, string | number | string[] | undefined>): string {
   const p = new URLSearchParams()
   for (const [k, v] of Object.entries(params)) {
-    if (v !== undefined && v !== '') p.set(k, String(v))
+    if (v === undefined || v === '') continue
+    if (Array.isArray(v)) v.forEach((x) => p.append(k, x))
+    else p.set(k, String(v))
   }
   const s = p.toString()
   return s ? `?${s}` : ''
 }
 
+// The moments query as wire params. The one place a MomentsQuery becomes a URL, so the
+// structured `subject` selector is rendered in exactly one spot.
+export function momentsParams(q: MomentsQuery): Record<string, string | number | string[] | undefined> {
+  const { subject, ...rest } = q
+  return { ...rest, subject: subject?.length ? subject.map(subjectParam) : undefined }
+}
+
 export const api = {
   // Reads
   day: (d: string) => get(`/api/days/${encodeURIComponent(d)}`).then(ok<DayResponse>),
-  moments: (q: MomentsQuery) => get(`/api/moments${qs({ ...q })}`).then(ok<MomentsPage>),
+  moments: (q: MomentsQuery) => get(`/api/moments${qs(momentsParams(q))}`).then(ok<MomentsPage>),
   moment: (id: number) => get(`/api/moments/${id}`).then(ok<ObsView>),
   overview: () => get('/api/overview').then(ok<Overview>),
   insights: (asOf?: string) =>
@@ -445,9 +512,19 @@ export const api = {
 
   // Moment commands (the id is in the path)
   review: (ids: number[]) => post('/api/moments/review', { ids }).then(ok<{ ok: boolean }>),
-  correct: (id: number, req: CorrectReq) =>
-    post(`/api/moments/${id}/correction`, req).then(ok<{ ok: boolean }>),
-  edit: (id: number, req: EditReq) => post(`/api/moments/${id}/edit`, req).then(ok<{ ok: boolean }>),
+  // A subject the model missed. `species` is what a camera can perceive; naming the
+  // individual is a separate correction against the new sighting.
+  addSighting: (id: number, req: AddSightingReq) =>
+    post(`/api/moments/${id}/sightings`, req).then(ok<{ ok: boolean }>),
+  // A subject the model invented. The server renumbers the identity overrides with it.
+  removeSighting: (id: number, ix: number) =>
+    del(`/api/moments/${id}/sightings/${ix}`).then(ok<{ ok: boolean }>),
+  // Both address one sighting by index, so a moment with several subjects can have each
+  // named and edited on its own.
+  correct: (id: number, ix: number, req: CorrectReq) =>
+    post(`/api/moments/${id}/sightings/${ix}/correction`, req).then(ok<{ ok: boolean }>),
+  edit: (id: number, ix: number, req: EditReq) =>
+    post(`/api/moments/${id}/sightings/${ix}/edit`, req).then(ok<{ ok: boolean }>),
   revert: (id: number) => post(`/api/moments/${id}/revert`, {}).then(ok<{ ok: boolean }>),
   del: (id: number) => del(`/api/moments/${id}`).then(ok<{ ok: boolean }>),
   keep: (id: number, body: { petId?: string; caption?: string }) =>

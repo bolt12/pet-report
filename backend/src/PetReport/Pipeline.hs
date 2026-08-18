@@ -9,7 +9,6 @@ module PetReport.Pipeline
   , batch
   , buildDay
   , advanceWatermark
-  , proofRetainDays
   , ingestWindow
   , ingestWindowSafe
   , Budget
@@ -25,8 +24,8 @@ module PetReport.Pipeline
 
 import qualified Control.Concurrent.Async as Async
 import           Control.Concurrent.MVar  (MVar, putMVar, tryTakeMVar)
-import           Control.Exception        (SomeException, bracket, handle,
-                                           throwIO, try)
+import           Control.Exception        (SomeException, bracket, throwIO,
+                                           try)
 import           Control.Concurrent.STM   (readTVarIO)
 import           Control.Monad            (foldM, forM_, unless, void, when)
 import           Data.Aeson               (object, (.=))
@@ -52,15 +51,12 @@ import           System.FilePath          ((</>))
 import           PetReport.App                 (App (..), appBatchLock,
                                                 appRetention)
 import           PetReport.Config              (Config (..))
-import           PetReport.Domain.Behavior     (Behaviors (..),
-                                                accidentSuspected,
-                                                injurySuspected)
 import           PetReport.Domain.Observation  (FrigateMeta (..),
                                                 NewObservation (..),
                                                 Observation (..), Origin (..))
 import           PetReport.Domain.Perception   (Appearance (..), Perception (..),
                                                 Scene (..), SoundKind (..),
-                                                isPerson, isSafetySound)
+                                                isPerson)
 import           PetReport.Domain.PetReport    (BalanceV (..), PetInsights (..),
                                                 Spot (..), WellbeingV (..),
                                                 insightsFor)
@@ -69,9 +65,12 @@ import           PetReport.Domain.Profile      (Overrides, Pet (..), Profile,
                                                 enabledCameras, gcWindowDays, pets)
 import           PetReport.Domain.Report       (Period (..), Report (..))
 import           PetReport.Domain.Stats        (SubjectKey (..),
+                                                appearancesOf,
+                                                concerningAppearance,
+                                                isConcerning,
                                                 subjectAppearances)
-import           PetReport.Domain.Types        (Camera (..), EventId (..),
-                                                Wellbeing (..))
+import           PetReport.Domain.Types        (Camera (..), EventId (..))
+import           PetReport.Domain.View         (proofRetainDays)
 import           PetReport.Domain.Window       (dayKeyText, localDayOf,
                                                 localDayWindow, startOfLocalDay)
 import qualified PetReport.Effect.Clock        as Clock
@@ -86,15 +85,14 @@ import           PetReport.Pipeline.Queue      (listJpgs, moveToProof, removeQui
                                                 tryRead, withTs, writeQueueFrame)
 import qualified PetReport.Analysis.Recap      as Recap
 import qualified PetReport.Analysis.IdentGuide as IdentGuide
-import           PetReport.Util                (boundedLines, tshow)
+import           PetReport.Util                (boundedLines, catchSync, tshow)
 import           PetReport.Trace               (PipelineEvent (..), SkipReason (..),
                                                 Tracer, pipelineTracer, traceWith)
 import qualified PetReport.Analysis.Vision     as Vision
 
--- Tunables (candidates to move into Config later).
-proofRetainDays :: Double
-proofRetainDays = 30
-
+-- Tunables (candidates to move into Config later). @proofRetainDays@ used to sit here too,
+-- and three Web modules imported this whole module to reach it; it now lives beside the
+-- view code that reads it.
 queueRetainDays :: Double
 queueRetainDays = 2
 
@@ -487,16 +485,16 @@ recordBatch app at' status note =
 -- hiccup here must not fail the batch.
 refreshBriefStep :: App -> Profile -> IO ()
 refreshBriefStep app prof =
-  handle onErr (IdentGuide.refreshIfStale (appLlm app) (appDb app) prof)
+  IdentGuide.refreshIfStale (appLlm app) (appDb app) prof `catchSync` onErr
   where
-    onErr (e :: SomeException) =
+    onErr e =
       traceWith (ptrace app) (BriefRefreshFailed (tshow e))
 
 -- | Analyse queued sample frames. A model outage aborts and leaves the frames queued. An
 -- empty-room frame is discarded; a frame with a pet in it is kept as proof and stored.
 analyzeQueue :: App -> Budget -> Profile -> IO ()
 analyzeQueue app budget prof =
-  handle onErr $ do
+  flip catchSync onErr $ do
     brief <- IdentGuide.identGuide (appDb app) prof
     queues <- mapM pending (enabledCameras prof)
     -- Round-robin rather than draining each camera in turn. Sequentially, a share that runs
@@ -507,8 +505,7 @@ analyzeQueue app budget prof =
     forM_ (concat (transpose queues)) (analyseFrame brief)
   where
     cfg = appConfig app
-    onErr (e :: SomeException) =
-      traceWith (ptrace app) (ModelUnavailable (tshow e))
+    onErr e = traceWith (ptrace app) (ModelUnavailable (tshow e))
     pending cam = do
       files <- sort <$> listJpgs (cfgQueueDir cfg </> T.unpack cam)
       pure [(cam, f) | f <- mapMaybe withTs files]
@@ -649,10 +646,9 @@ clampToRetention app nowP mwm = do
 -- watermark where it was for the next run to retry.
 ingestWindowSafe :: App -> Budget -> Profile -> Double -> Double -> IO Double
 ingestWindowSafe app budget prof lo hi =
-  handle onErr (ingestWindow app budget prof lo hi)
+  ingestWindow app budget prof lo hi `catchSync` onErr
   where
-    onErr (e :: SomeException) =
-      lo <$ traceWith (ptrace app) (EventIngestFailed (tshow e))
+    onErr e = lo <$ traceWith (ptrace app) (EventIngestFailed (tshow e))
 
 -- | Ingest pet and audio events whose start falls in the half-open window @[lo, hi)@,
 -- oldest-first, returning the watermark the window resolves to. The daily batch persists
@@ -964,7 +960,7 @@ finishReportFor app prof day notify = do
 -- recap, caching the result. A model outage skips them all, and the stats still render
 -- without the prose.
 writePetSummaries :: App -> Profile -> IO ()
-writePetSummaries app prof = handle onErr $ do
+writePetSummaries app prof = flip catchSync onErr $ do
   let clk = appClock app
       roster = pets prof
       crs = cameras prof
@@ -979,8 +975,7 @@ writePetSummaries app prof = handle onErr $ do
     summary <- Recap.petWeekly (appLlm app) pet (wbKind (piWellbeing ins)) (statPairs ins) body
     Db.putPetSummary (appDb app) (piId ins) now summary
   where
-    onErr (e :: SomeException) =
-      traceWith (ptrace app) (PetSummariesFailed (tshow e))
+    onErr e = traceWith (ptrace app) (PetSummariesFailed (tshow e))
 
 mentions :: Overrides -> [Pet] -> Pet -> Observation -> Bool
 mentions ov roster pet o =
@@ -1005,14 +1000,15 @@ statPairs ins =
 hasPet :: Scene -> Bool
 hasPet sc = not (all (isPerson . who) (appearances sc))
 
+-- | Whether a moment is worth raising the daily push to a warning.
+--
+-- Wider than the card's 'isConcerning', by exactly the per-appearance health signals: a scene
+-- the model called normal still earns a warning if it recorded a limp, an injury or an indoor
+-- accident. Both halves read their existing rule rather than restating it, so a change to
+-- either follows here.
 concerningObs :: Observation -> Bool
-concerningObs obs = case perception obs of
-  Seen sc  -> wellbeing sc == Concerning || any bad (appearances sc)
-  Heard sk -> isSafetySound sk
-  where
-    bad ap =
-      let b = behaviors ap
-       in not (null (concerns b)) || accidentSuspected b || injurySuspected b
+concerningObs obs =
+  isConcerning (perception obs) || any concerningAppearance (appearancesOf obs)
 
 -- | A UTC time as fractional POSIX seconds, the unit the event watermark and Frigate's
 -- @after@/@before@ bounds use.

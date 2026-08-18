@@ -58,10 +58,11 @@ visionInstructions brief =
     , "If a pet's note explains a normal condition (a missing limb, a healed scar, a permanent squint or tremor), treat it as normal for that pet: never report it as an injury, a limp, or a concern; you may use it to identify the pet."
     , "If no animal or person is visible, use an empty \"appearances\" list."
     , "If the frame is dark, blurred, in night/IR mode, or shows only part of an animal, lower the confidence and prefer the activity \"unclear\" over a confident guess."
+    , "Always fill \"confidence\": how sure you are of both the identification and the activity, from 0.0 to 1.0. Never omit it and never leave it null. Use the whole range, not just a few high values: a clear daylight view of a distinctive pet belongs near 0.95, a dim or partial view near 0.3."
     , "Keep the behaviour flags consistent with the activity. A crouching or still animal is NOT necessarily toileting; report elimination only when clearly visible, and set its place: litter_box, outdoors, or inappropriate (an indoor accident). Set \"ate\"/\"drank\" only when the animal is visibly consuming food or water, not merely near a bowl."
     , "Fill \"description\" with one neutral, specific sentence for the whole scene (never blank or null); vary the wording and do not begin with \"The image shows\"."
     , "Examples of the expected JSON:"
-    , "- Empty room: {\"appearances\": [], \"description\": \"The room is empty.\", \"wellbeing\": \"normal\"}"
+    , "- Empty room: {\"appearances\": [], \"description\": \"The room is empty.\", \"wellbeing\": \"normal\", \"confidence\": 0.95}"
     , "- A cat asleep: {\"appearances\": [{\"who\": \"cat\", \"activity\": \"sleeping\", \"behaviors\": {\"ate\": false, \"drank\": false, \"slept\": true, \"played\": false, \"groomed\": false, \"concerns\": []}, \"where\": \"on the sofa\"}], \"description\": \"A cat is asleep on the sofa.\", \"wellbeing\": \"normal\", \"confidence\": 0.9}"
     , "- Two animals in night vision, unsure which pets: {\"appearances\": [{\"who\": \"dog\", \"activity\": \"walking\", \"behaviors\": {\"ate\": false, \"drank\": false, \"slept\": false, \"played\": false, \"groomed\": false, \"concerns\": []}}, {\"who\": \"cat\", \"activity\": \"standing\", \"behaviors\": {\"ate\": false, \"drank\": false, \"slept\": false, \"played\": false, \"groomed\": false, \"concerns\": []}}], \"description\": \"A dog and a cat move through a dim, infrared-lit room.\", \"wellbeing\": \"normal\", \"confidence\": 0.4}"
     ]

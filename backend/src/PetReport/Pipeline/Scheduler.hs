@@ -9,7 +9,6 @@ module PetReport.Pipeline.Scheduler
   ) where
 
 import           Control.Concurrent  (threadDelay)
-import           Control.Exception   (SomeException, handle)
 import           Control.Monad       (forever, void)
 import           Data.List           (sort)
 import           Data.Maybe          (listToMaybe)
@@ -25,7 +24,7 @@ import           PetReport.Domain.Window   (localDayOf)
 import qualified PetReport.Effect.Clock    as Clock
 import qualified PetReport.Effect.Db       as Db
 import qualified PetReport.Pipeline        as Pipeline
-import           PetReport.Util            (microseconds, tshow)
+import           PetReport.Util            (catchSync, microseconds, tshow)
 import           PetReport.Trace           (PipelineEvent (..), pipelineTracer,
                                             traceWith)
 import           PetReport.Pipeline.Worker (Job (RunBatch), submit)
@@ -47,7 +46,7 @@ runCaptureScheduler app = forever $ do
 -- nothing down, and must not kill the loop and stop capture silently.
 captureInterval :: App -> IO NominalDiffTime
 captureInterval app =
-  handle (\(_ :: SomeException) -> pure (cfgCaptureSecs (appConfig app))) $ do
+  flip catchSync (\_ -> pure (cfgCaptureSecs (appConfig app))) $ do
     prof <- Db.getProfile (appDb app)
     pure (cfgCaptureSecs (applyProfile prof (appBaseConfig app)))
 
@@ -76,6 +75,10 @@ untilNextBatch app = do
     Just t  -> microseconds (max 1 (diffUTCTime t now))
     Nothing -> microseconds 3600
 
+-- | Run one scheduler step, tracing a synchronous failure instead of letting it kill the
+-- loop. An async exception (a shutdown cancellation) is rethrown, so the loop can actually
+-- be stopped: 'catchSync' is what separates the two.
 guarded :: Text -> App -> IO () -> IO ()
-guarded what app =
-  handle (\e -> traceWith (pipelineTracer (appTracer app)) (SchedulerStepFailed what (tshow (e :: SomeException))))
+guarded what app act =
+  act `catchSync` \e ->
+    traceWith (pipelineTracer (appTracer app)) (SchedulerStepFailed what (tshow e))
