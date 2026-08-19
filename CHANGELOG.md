@@ -52,6 +52,10 @@ Notable changes to pet-report, newest first.
 
 ### Bug fixes
 
+- Naming a subject the model read as a person now works, and settles what it was.
+  Marking a sighting as one of your pets used to be refused outright on a person,
+  and on an animal it left the detected species alone, so a moment corrected to a
+  cat still filtered as a dog.
 - A moment can hold a pet AND a person. The model misses subjects, and until now the
   only thing an owner could do was retarget what it did report, so a frame read as
   one cat could be called a cat or a person and never both. Subjects can now be

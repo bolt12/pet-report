@@ -669,7 +669,14 @@ updateObservationPerceptionIf h oid ok f = do
 -- moment, so correcting the cat also relabelled the dog beside it.
 correctObservation :: Handle -> Int64 -> Int -> Correction -> IO Bool
 correctObservation h oid ix corr = case corr of
-  ToPet pid -> writeOverride h oid ix (IdPet pid)
+  -- Settle the species in the blob FIRST, then write the identity. The order matters twice
+  -- over: 'writeOverride' refuses a person sighting, so a mis-read person could not be
+  -- named at all until the reading was fixed; and leaving a mis-detected species behind
+  -- meant the projection still said "dog" for a sighting the owner had called a cat, so a
+  -- species filter missed a moment the pet filter returned.
+  ToPet pid _ -> do
+    okBlob <- updateSighting h oid ix (applyCorrectionAt ix corr)
+    if okBlob then writeOverride h oid ix (IdPet pid) else pure False
   ToVisiting -> writeOverride h oid ix IdVisiting
   ToSpecies _ -> updateSighting h oid ix (applyCorrectionAt ix corr)
   ToPerson ->

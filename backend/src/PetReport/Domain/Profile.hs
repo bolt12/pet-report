@@ -317,6 +317,8 @@ resolveCorrection roster t = case t of
   TargetVisiting -> Just ToVisiting
   TargetPerson -> Just ToPerson
   TargetSpecies s -> Just (ToSpecies (Species s))
-  TargetPet pid
-    | any ((== PetId pid) . petId) roster -> Just (ToPet (PetId pid))
-    | otherwise -> Nothing
+  -- The roster is what knows the pet's species, so it is attached here rather than left
+  -- for the persistence layer to look up.
+  TargetPet pid -> case find ((== PetId pid) . petId) roster of
+    Just p  -> Just (ToPet (petId p) (petSpecies p))
+    Nothing -> Nothing

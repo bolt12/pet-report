@@ -326,7 +326,8 @@ genUTCTime = UTCTime <$> genDay <*> (fromIntegral <$> Gen.int (Range.linear 0 86
 perceptionUnits :: [TestTree]
 perceptionUnits =
   [ testProperty "normalizeScene is idempotent" prop_normalizeIdempotent
-  , testProperty "an individual attribution (pet/visiting) leaves the perception blob unchanged" prop_correctionIndividualKeepsBlob
+  , testProperty "a visiting attribution leaves the perception blob unchanged" prop_visitingKeepsBlob
+  , testProperty "naming a pet settles that sighting's species and nothing else" prop_toPetSettlesSpecies
   , testProperty "a correction changes the addressed sighting and no other" prop_correctionHitsOneSighting
   , testProperty "an edit changes the addressed sighting and no other" prop_editHitsOneSighting
   , testProperty "an out-of-range sighting index leaves the scene alone" prop_outOfRangeIsNoop
@@ -349,14 +350,29 @@ prop_normalizeIdempotent = property $ do
   sc <- forAll genScene
   normalizeScene (normalizeScene sc) === normalizeScene sc
 
--- ToPet/ToVisiting are per-individual attributions stored as overrides at the DB layer;
--- they must never rewrite the model-facing perception blob.
-prop_correctionIndividualKeepsBlob :: Property
-prop_correctionIndividualKeepsBlob = property $ do
+-- Marking a sighting as not-the-owner's is purely an attribution: it says nothing about
+-- what the camera saw, so the model-facing blob is untouched and the override carries it.
+prop_visitingKeepsBlob :: Property
+prop_visitingKeepsBlob = property $ do
   p <- forAll genPerception
   i <- forAll (Gen.int (Range.linear 0 4))
   applyCorrectionAt i ToVisiting p === p
-  applyCorrectionAt i (ToPet (PetId "dexter")) p === p
+
+-- Naming an individual DOES say what kind of thing was seen: "that is Mochi" settles that
+-- the sighting is a cat. So it rewrites that sighting's species, and only that sighting's.
+-- Leaving the species alone is what used to let the projection say "dog" for a sighting the
+-- owner had called a cat.
+prop_toPetSettlesSpecies :: Property
+prop_toPetSettlesSpecies = property $ do
+  sc <- forAll genScene
+  i <- forAll (Gen.int (Range.linear 0 (max 0 (length (appearances sc) - 1))))
+  case applyCorrectionAt i (ToPet (PetId "dexter") (Species "cat")) (Seen sc) of
+    Seen sc' -> do
+      untouched i (appearances sc) === untouched i (appearances sc')
+      case drop i (appearances sc') of
+        (ap : _) | i < length (appearances sc) -> who ap === AnAnimal (Species "cat")
+        _                                      -> pure ()
+    Heard _ -> failure
 
 -- A correction rewrites the subject of exactly the addressed sighting. Every other
 -- appearance, and every Heard sound, comes back byte-identical.
@@ -782,7 +798,7 @@ viewUnits =
       -- because the target sum cannot hold two answers at once, which is the point of it.
       resolveCorrection roster TargetVisiting @?= Just ToVisiting
       resolveCorrection roster TargetPerson @?= Just ToPerson
-      resolveCorrection roster (TargetPet "dexter") @?= Just (ToPet (PetId "dexter"))
+      resolveCorrection roster (TargetPet "dexter") @?= Just (ToPet (PetId "dexter") (Species "cat"))
       resolveCorrection roster (TargetSpecies "cat") @?= Just (ToSpecies (Species "cat"))
       -- A pet id absent from the roster is rejected rather than quietly demoted to the
       -- species. The old fall-through turned a typo into a correction nobody asked for.
@@ -1148,7 +1164,7 @@ dbUnits =
                 PeriodicSample
                 (Seen emptyScene {appearances = [ap "cat", ap "dog"]})
             )
-          _ <- Db.correctObservation h 3 1 (ToPet (PetId "rex"))
+          _ <- Db.correctObservation h 3 1 (ToPet (PetId "rex") (Species "dog"))
           ovBefore <- Db.overridesForObs h 3
           Map.toList ovBefore @?= [((3, 1), IdPet (PetId "rex"))]
           removed <- Db.removeObservationSighting h 3 0
@@ -1175,7 +1191,7 @@ dbUnits =
               sc = emptyScene {appearances = [ap "cat", ap "dog", person]}
           Db.insertObservation h (NewObservation base (Camera "office") PeriodicSample (Seen sc))
           -- Name only the dog.
-          ok <- Db.correctObservation h 1 1 (ToPet (PetId "rex"))
+          ok <- Db.correctObservation h 1 1 (ToPet (PetId "rex") (Species "dog"))
           ok @?= True
           ov <- Db.overridesForObs h 1
           -- Exactly one override row, on the sighting that was named.
@@ -1183,11 +1199,18 @@ dbUnits =
           -- The cat resolves by the roster's sole-cat rule, NOT to Rex.
           identifyWith ov roster' (1, 0) (ap "cat") @?= KnownPet miso
           identifyWith ov roster' (1, 1) (ap "dog") @?= KnownPet rex
-          -- A person sighting refuses an animal identity outright.
-          refused <- Db.correctObservation h 1 2 (ToPet (PetId "rex"))
-          refused @?= False
-          -- So does a sighting the scene does not hold.
-          outOfRange <- Db.correctObservation h 1 9 (ToPet (PetId "rex"))
+          -- Naming a sighting the model read as a person works: it settles the species
+          -- first, then assigns the pet. This used to be refused outright, which left the
+          -- owner unable to say "that is not a person, that is Rex".
+          named <- Db.correctObservation h 1 2 (ToPet (PetId "rex") (Species "dog"))
+          named @?= True
+          o' <- Db.getObservation h 1
+          fmap (\o -> case perception o of Seen s -> map who (appearances s); Heard _ -> []) o'
+            @?= Just [AnAnimal (Species "cat"), AnAnimal (Species "dog"), AnAnimal (Species "dog")]
+          ov' <- Db.overridesForObs h 1
+          Map.lookup (1, 2) ov' @?= Just (IdPet (PetId "rex"))
+          -- A sighting the scene does not hold is still refused.
+          outOfRange <- Db.correctObservation h 1 9 (ToPet (PetId "rex") (Species "dog"))
           outOfRange @?= False
   , testCase "SQL subjectStatsBetween agrees with blob presence, honouring overrides" $
       withSystemTempDirectory "petreport-spec" $ \dir ->
@@ -1211,7 +1234,7 @@ dbUnits =
                   (Seen emptyScene {appearances = [catAp eat]})
           mapM_ (Db.insertObservation h) [obsAt 1 True, obsAt 2 False, obsAt 3 True]
           -- SQLite assigns ids 1..3 in insert order.
-          _ <- Db.correctObservation h 1 0 (ToPet (PetId "mochi"))
+          _ <- Db.correctObservation h 1 0 (ToPet (PetId "mochi") (Species "cat"))
           _ <- Db.correctObservation h 3 0 ToVisiting
           let lo = base
               hi = addUTCTime 100000 base
@@ -1254,15 +1277,15 @@ dbUnits =
               hi = addUTCTime 100000 base
               day = "2026-07-08"
           mapM_ (Db.insertObservation h) [obsAt 1 True, obsAt 2 False, obsAt 3 True, obsDog 4]
-          _ <- Db.correctObservation h 1 0 (ToPet (PetId "mochi"))
+          _ <- Db.correctObservation h 1 0 (ToPet (PetId "mochi") (Species "cat"))
           -- The rollup for the day equals a live compute over the same window.
           live <- storedStatsMap <$> Db.subjectStatsBetween h lo hi
           Db.materializeDay h day lo hi
           Db.dailyPetStats h day >>= (@?= live) . storedStatsMap
           -- Re-materialising after further corrections replaces the day cleanly, never
           -- doubling, and Mochi (now seen as both cat and dog) sums across both species.
-          _ <- Db.correctObservation h 2 0 (ToPet (PetId "mochi"))
-          _ <- Db.correctObservation h 4 0 (ToPet (PetId "mochi"))
+          _ <- Db.correctObservation h 2 0 (ToPet (PetId "mochi") (Species "cat"))
+          _ <- Db.correctObservation h 4 0 (ToPet (PetId "mochi") (Species "cat"))
           live2 <- storedStatsMap <$> Db.subjectStatsBetween h lo hi
           Db.materializeDay h day lo hi
           rolled2 <- storedStatsMap <$> Db.dailyPetStats h day
@@ -1327,7 +1350,7 @@ dbUnits =
           mapM_ (Db.insertObservation h) [obsAt 1 Eating, obsAt 2 Sleeping, obsAt 3 Drinking]
           -- SQLite assigns ids 1..3 in insert order; correct obs 1 to the pet so the
           -- SQL path yields a KPet bucket while obs 2/3 stay in KSpecies.
-          _ <- Db.correctObservation h 1 0 (ToPet (PetId "dexter"))
+          _ <- Db.correctObservation h 1 0 (ToPet (PetId "dexter") (Species "cat"))
           let lo = base
               hi = addUTCTime 100000 base
           obss <- Db.observationsBetween h lo hi
@@ -1353,7 +1376,7 @@ dbUnits =
                   PeriodicSample
                   (Seen emptyScene {appearances = [Appearance (AnAnimal (Species "cat")) Sleeping noBehaviors Nothing]})
           Db.insertObservation h catObs
-          _ <- Db.correctObservation h 1 0 (ToPet (PetId "mochi"))
+          _ <- Db.correctObservation h 1 0 (ToPet (PetId "mochi") (Species "cat"))
           let lo = addUTCTime (-100) base
               hi = addUTCTime 100 base
           before <- Db.overridesBetween h lo hi
@@ -1383,9 +1406,9 @@ dbUnits =
           Db.putProfile h emptyProfile {pets = [miso, mochi]}
           Db.putPetSummary h "mochi" base (Db.PetSummary Settled (Just "a good week") [])
           mapM_ (Db.insertObservation h) [catObs 1, catObs 2, catObs 3, catObs 4]
-          _ <- Db.correctObservation h 1 0 (ToPet (PetId "mochi")) -- mochi's moment
-          _ <- Db.correctObservation h 2 0 (ToPet (PetId "miso")) -- miso's moment
-          _ <- Db.correctObservation h 3 0 (ToPet (PetId "miso")) -- miso's, but was kept as mochi
+          _ <- Db.correctObservation h 1 0 (ToPet (PetId "mochi") (Species "cat")) -- mochi's moment
+          _ <- Db.correctObservation h 2 0 (ToPet (PetId "miso") (Species "cat")) -- miso's moment
+          _ <- Db.correctObservation h 3 0 (ToPet (PetId "miso") (Species "cat")) -- miso's, but was kept as mochi
           _ <- Db.insertKeepsake h 3 (Just "mochi") Nothing base
           _ <- Db.insertKeepsake h 4 (Just "mochi") Nothing base -- kept as mochi, never corrected
           deleted <-
@@ -1482,7 +1505,7 @@ dbUnits =
           -- Pet facet mirrors the stats attribution. Correct obs 2 to a specific pet;
           -- the unique-active-species branch then counts every unattributed cat too,
           -- while the no-species branch counts only the explicit override.
-          _ <- Db.correctObservation h 2 0 (ToPet (PetId "mochi"))
+          _ <- Db.correctObservation h 2 0 (ToPet (PetId "mochi") (Species "cat"))
           allCats <- Db.browseMoments h bq0 {Db.bqSubjects = [Db.SubjPet (Db.PetFilter "mochi" (Just "cat"))]}
           ids allCats @?= [1, 2, 3, 4]
           onlyMochi <- Db.browseMoments h bq0 {Db.bqSubjects = [Db.SubjPet (Db.PetFilter "mochi" Nothing)]}
@@ -1576,7 +1599,7 @@ dbUnits =
                   PeriodicSample
                   (Seen emptyScene {appearances = [Appearance (AnAnimal (Species "cat")) Sleeping noBehaviors Nothing]})
           mapM_ (Db.insertObservation h) [catObs 1, catObs 2, catObs 3]
-          _ <- Db.correctObservation h 2 0 (ToPet (PetId "mochi"))
+          _ <- Db.correctObservation h 2 0 (ToPet (PetId "mochi") (Species "cat"))
           -- The batch read is keyed by id and holds exactly the ids that exist; a
           -- missing id (99) is simply absent, as the single-row Nothing would drop it.
           byId <- Db.getObservationsByIds h [1, 2, 3, 99]

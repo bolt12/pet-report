@@ -2,7 +2,7 @@
   import Thumb from './Thumb.svelte'
   import Chip from './Chip.svelte'
   import WellbeingDot from './WellbeingDot.svelte'
-  import { api, type AddSightingReq, type ObsView, type Pet } from './api'
+  import { api, type AddSightingReq, type CorrectReq, type ObsView, type Pet } from './api'
   import { fmtWhen, friendlyError, serverMessage, BEHAVIOUR_FLAGS, type BehaviourFlag } from './ui'
 
   let {
@@ -168,18 +168,19 @@
     })
   const confirmOk = () => act(() => api.review([view.id]), 'Confirmed.')
 
-  // Which sighting the corrections and the edit apply to. A moment holding two cats and a
-  // sitter is three sightings, and each carries its own identity, so naming one must not
-  // touch the others. Defaults to the first animal, which is the whole story for the
-  // single-subject moment that most of them are.
-  let subjectIx = $state(0)
+  // Which subject row has its options open. Presentation only: a correction is addressed
+  // by the row it came from, never by a selection held somewhere else.
+  let editingIx = $state<number | null>(null)
   $effect(() => {
-    // Re-seed whenever the moment changes, preferring an animal over a person.
     view.id
-    const firstAnimal = view.subjects.find((s) => !s.person)
-    subjectIx = firstAnimal?.ix ?? view.subjects[0]?.ix ?? 0
+    editingIx = null
   })
-  let subjectName = $derived(view.subjects.find((s) => s.ix === subjectIx)?.label ?? 'this one')
+
+  // The field edit still applies to one sighting. It targets the first animal, since the
+  // activity and behaviour flags it carries are animal facts; the note and wellbeing it
+  // also sets are scene-level and land whatever is addressed.
+  let editIx = $derived(view.subjects.find((s) => !s.person)?.ix ?? view.subjects[0]?.ix ?? 0)
+  let editSubjectName = $derived(view.subjects.find((s) => s.ix === editIx)?.label ?? 'this one')
 
   // Adding a subject the model missed, and removing one it invented. Both reload the
   // moment, since the server may renumber the sightings.
@@ -191,13 +192,15 @@
     structural(() => api.addSighting(view.id, req), 'Added.', () => (addingSubject = false))
   const dropSubject = (ix: number) => structural(() => api.removeSighting(view.id, ix), 'Removed.')
 
-  // Naming a subject changes the label the list above shows, so these re-read too.
-  const reclass = (petId: string, name: string) =>
-    structural(() => api.correct(view.id, subjectIx, { kind: 'pet', petId }), `Marked as ${name}.`)
-  const asVisitor = () =>
-    structural(() => api.correct(view.id, subjectIx, { kind: 'visiting' }), 'Marked as not your pet.')
-  const asPerson = () =>
-    structural(() => api.correct(view.id, subjectIx, { kind: 'person' }), 'Marked as a person.')
+  // Each takes the row it came from. Naming a subject changes the label that row shows,
+  // so they re-read the moment; the open row closes because the options it offered no
+  // longer describe what is there.
+  const retarget = (ix: number, req: CorrectReq, message: string) =>
+    structural(() => api.correct(view.id, ix, req), message, () => (editingIx = null))
+  const reclass = (ix: number, petId: string, name: string) =>
+    retarget(ix, { kind: 'pet', petId }, `Marked as ${name}.`)
+  const asNotMine = (ix: number) => retarget(ix, { kind: 'visiting' }, 'Marked as not your pet.')
+  const asPerson = (ix: number) => retarget(ix, { kind: 'person' }, 'Marked as a person.')
   const remove = () => run(() => api.del(view.id), 'Deleted.', true)
   const keep = () =>
     busyDo(async () => {
@@ -229,7 +232,7 @@
   }
   const saveEdit = () =>
     busyDo(async () => {
-      await api.edit(view.id, subjectIx, {
+      await api.edit(view.id, editIx, {
         activity: eActivity,
         wellbeing: eWellbeing,
         description: eDesc,
@@ -469,62 +472,59 @@
     </div>
 
     {#if !isReviewed}
-    <!-- The moment's subjects, always shown. A frame can hold a pet AND a person, so this
-         is a list you can add to and remove from, not a single choice. Tapping one selects
-         it for the correction and edit controls below. -->
+    <!-- One row per subject, each editing itself. The previous version made this a
+         "pick one" row feeding a separate editor below, which read as a question about
+         who was present and then asked you to set who "A person" is. A subject is not a
+         mode: it is a thing in the picture, so its own row carries its own controls. -->
     <div class="mt-3 text-[11px] font-bold tracking-wide uppercase" style="color:rgba(255,246,236,0.5)">
       Who's in this one?
     </div>
-    <div class="mt-2 flex flex-wrap items-center gap-[8px]">
+    <div class="mt-2 flex flex-col gap-[6px]">
       {#each view.subjects as s (s.ix)}
-        <span class="inline-flex items-center gap-[6px] rounded-full px-[12px] py-[7px] text-[13px] font-bold"
-          style={s.ix === subjectIx
-            ? 'background:var(--accent);color:var(--ink)'
-            : 'background:rgba(255,246,236,0.1);color:#f4ece3'}>
-          <button onclick={() => (subjectIx = s.ix)} disabled={busy} style="border:none;background:none;padding:0;font:inherit;color:inherit;cursor:pointer">{s.label}</button>
-          <button
-            onclick={() => dropSubject(s.ix)}
-            disabled={busy}
-            title="Not actually there"
-            style="border:none;background:none;padding:0;font:inherit;color:inherit;opacity:.65;cursor:pointer">&times;</button>
-        </span>
+        <div class="rounded-[14px]" style="background:rgba(255,246,236,0.07)">
+          <div class="flex items-center gap-[8px] px-[12px] py-[9px]">
+            <span class="min-w-0 flex-1 truncate text-[13.5px] font-bold" style="color:#f4ece3">{s.label}</span>
+            <button
+              onclick={() => (editingIx = editingIx === s.ix ? null : s.ix)}
+              disabled={busy}
+              class="flex-shrink-0 text-[12px] font-bold"
+              style="border:none;background:none;color:var(--accent)">{editingIx === s.ix ? 'Done' : 'Change'}</button>
+            <button
+              onclick={() => dropSubject(s.ix)}
+              disabled={busy}
+              title="Not actually there"
+              class="flex-shrink-0 text-[15px]"
+              style="border:none;background:none;color:rgba(255,246,236,0.5)">&times;</button>
+          </div>
+          {#if editingIx === s.ix}
+            <!-- Options for THIS subject. What it currently is never appears as a choice. -->
+            <div class="flex flex-wrap gap-[7px] px-[12px] pt-[2px] pb-[11px]">
+              {#each pets.filter((p) => p.petId !== s.petId) as p (p.petId)}
+                <button onclick={() => reclass(s.ix, p.petId, p.petName)} disabled={busy} class="rounded-full px-[12px] py-[6px] text-[12.5px] font-bold disabled:opacity-50" style="background:rgba(255,246,236,0.12);color:#f4ece3">It's {p.petName}</button>
+              {/each}
+              {#if !s.person}
+                <button onclick={() => asNotMine(s.ix)} disabled={busy} class="rounded-full px-[12px] py-[6px] text-[12.5px] font-bold disabled:opacity-50" style="background:rgba(255,246,236,0.12);color:#f4ece3">Not my pet</button>
+              {/if}
+              {#if !s.person}
+                <button onclick={() => asPerson(s.ix)} disabled={busy} class="rounded-full px-[12px] py-[6px] text-[12.5px] font-bold disabled:opacity-50" style="background:rgba(255,246,236,0.12);color:#f4ece3">A person</button>
+              {/if}
+            </div>
+          {/if}
+        </div>
       {/each}
+
       {#if addingSubject}
-        <span class="inline-flex flex-wrap items-center gap-[6px]">
-          <button onclick={() => addSubject({ kind: 'person' })} disabled={busy} class="rounded-full px-[12px] py-[7px] text-[13px] font-bold" style="background:rgba(255,246,236,0.1);color:#f4ece3">A person</button>
+        <div class="flex flex-wrap items-center gap-[7px] rounded-[14px] px-[12px] py-[10px]" style="background:rgba(255,246,236,0.07)">
+          <span class="text-[12.5px] font-bold" style="color:rgba(255,246,236,0.6)">Who else?</span>
+          <button onclick={() => addSubject({ kind: 'person' })} disabled={busy} class="rounded-full px-[12px] py-[6px] text-[12.5px] font-bold disabled:opacity-50" style="background:rgba(255,246,236,0.12);color:#f4ece3">A person</button>
           {#each speciesChoices as sp (sp)}
-            <button onclick={() => addSubject({ kind: 'species', species: sp })} disabled={busy} class="rounded-full px-[12px] py-[7px] text-[13px] font-bold capitalize" style="background:rgba(255,246,236,0.1);color:#f4ece3">A {sp}</button>
+            <button onclick={() => addSubject({ kind: 'species', species: sp })} disabled={busy} class="rounded-full px-[12px] py-[6px] text-[12.5px] font-bold capitalize disabled:opacity-50" style="background:rgba(255,246,236,0.12);color:#f4ece3">A {sp}</button>
           {/each}
           <button onclick={() => (addingSubject = false)} disabled={busy} class="text-[12px] font-bold" style="border:none;background:none;color:rgba(255,246,236,0.55)">Cancel</button>
-        </span>
+        </div>
       {:else}
-        <button onclick={() => (addingSubject = true)} disabled={busy} class="rounded-full px-[12px] py-[7px] text-[13px] font-bold" style="background:rgba(255,246,236,0.06);color:rgba(255,246,236,0.75);border:1px dashed rgba(255,246,236,0.25)">+ Someone else</button>
+        <button onclick={() => (addingSubject = true)} disabled={busy} class="rounded-[14px] py-[9px] text-[12.5px] font-bold disabled:opacity-50" style="background:none;color:rgba(255,246,236,0.7);border:1px dashed rgba(255,246,236,0.22)">+ Someone else was here</button>
       {/if}
-    </div>
-    <div class="mt-3 text-[11px] font-bold tracking-wide uppercase" style="color:rgba(255,246,236,0.5)">
-      {view.subjects.length > 1 ? `Not right? Set who ${subjectName} is` : 'Not right? Set who it is'}
-    </div>
-    <div class="mt-2 flex flex-wrap gap-[8px]">
-      {#each pets.filter((p) => !view.subjects.some((s) => s.ix === subjectIx && s.petId === p.petId)) as p (p.petId)}
-        <button
-          onclick={() => reclass(p.petId, p.petName)}
-          disabled={busy}
-          class="rounded-full px-[14px] py-[8px] text-[13px] font-bold disabled:opacity-50"
-          style="background:rgba(255,246,236,0.1);color:#f4ece3">It's {p.petName}</button
-        >
-      {/each}
-      <button
-        onclick={asVisitor}
-        disabled={busy}
-        class="rounded-full px-[14px] py-[8px] text-[13px] font-bold disabled:opacity-50"
-        style="background:rgba(255,246,236,0.1);color:#f4ece3">Not my pet</button
-      >
-      <button
-        onclick={asPerson}
-        disabled={busy}
-        class="rounded-full px-[14px] py-[8px] text-[13px] font-bold disabled:opacity-50"
-        style="background:rgba(255,246,236,0.1);color:#f4ece3">A person</button
-      >
     </div>
     {/if}
 
@@ -567,7 +567,7 @@
             {/each}
           </div>
           {#if view.subjects.length > 1}
-            <div class="mb-[10px] text-[11px] leading-[1.4]" style="color:rgba(255,246,236,0.5)">Activity and behaviours apply to {subjectName}. The note and wellbeing cover the whole moment.</div>
+            <div class="mb-[10px] text-[11px] leading-[1.4]" style="color:rgba(255,246,236,0.5)">Activity and behaviours apply to {editSubjectName}. The note and wellbeing cover the whole moment.</div>
           {/if}
           <button onclick={saveEdit} disabled={busy} class="w-full rounded-2xl py-[12px] text-[13.5px] font-extrabold disabled:opacity-50" style="background:var(--accent);color:var(--ink)">Save &amp; confirm</button>
           <div class="mt-[7px] text-center text-[11px]" style="color:rgba(255,246,236,0.45)">Saving also marks this moment as checked.</div>

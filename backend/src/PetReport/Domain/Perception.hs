@@ -200,7 +200,13 @@ sceneSchema = codecSchema @Scene
 data Correction
   = ToSpecies Species
   | ToPerson
-  | ToPet PetId
+  | -- | Name an individual. Carries the pet's species as well as its id, because naming
+    -- an individual also settles what KIND of thing was seen: if the model called it a dog
+    -- and the owner says it is Mochi the cat, then the species was wrong too. Without the
+    -- species here, the stored reading kept saying dog while the identity said Mochi, so a
+    -- species filter missed a moment a pet filter returned, and naming a mis-read person
+    -- was refused outright.
+    ToPet PetId Species
   | ToVisiting
   deriving stock (Eq, Show)
 
@@ -222,7 +228,8 @@ applyCorrectionAt ix corr (Seen sc) =
       | otherwise = case corr of
           ToSpecies sp -> ap {who = AnAnimal sp}
           ToPerson     -> ap {who = APerson}
-          ToPet _      -> ap
+          -- Settle the species too, so the reading agrees with the name.
+          ToPet _ sp   -> ap {who = AnAnimal sp}
           ToVisiting   -> ap
 applyCorrectionAt _ _ p = p
 
