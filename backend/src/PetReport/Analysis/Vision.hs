@@ -17,26 +17,32 @@ import           LLM.Call                    (Call (..), Sampling (..), mapReply
                                               note, refine, runMaybe, structured,
                                               userParts)
 import           PetReport.Domain.Perception (Scene, normalizeScene)
+import           PetReport.Domain.Profile    (Roster, resolvePetNames)
 import           PetReport.Domain.Types      (Species, speciesText)
 import qualified PetReport.Effect.Llm        as Llm
 import           PetReport.Util              (nonBlank, paragraphs)
 
 -- | Analyse one or more JPEG frames into a 'Scene', or 'Nothing' if the model returns no
--- usable JSON. @brief@ is the identification guide steering the prompt.
-analyze :: Llm.Handle -> Text -> [ByteString] -> IO (Maybe Scene)
-analyze llm brief frames = runMaybe llm (sceneCall brief frames)
+-- usable JSON. @brief@ is the identification guide steering the prompt, and @roster@ is what
+-- its answers are read back against: the guide names the pets, so the reply has to be
+-- checked for a name where a species belongs.
+analyze :: Llm.Handle -> Roster -> Text -> [ByteString] -> IO (Maybe Scene)
+analyze llm roster brief frames = runMaybe llm (sceneCall roster brief frames)
 
 -- | The vision-analysis task. 'analyze' runs on the serial batch worker draining the queue
 -- and events, so it takes the background budget: a generous cap plus one retry to ride out
 -- a transient blip, all under the batch wall-clock. Sampling is near-deterministic, since
 -- this is structured extraction rather than prose.
-sceneCall :: Text -> [ByteString] -> Call Scene
-sceneCall brief frames =
+sceneCall :: Roster -> Text -> [ByteString] -> Call Scene
+sceneCall roster brief frames =
   Call
     { callMessages = [userParts (Llm.TextPart prompt : map imagePart frames)]
     , callSampling = Sampling {samplingTemperature = 0.15, samplingMaxTokens = 700, samplingThinking = False}
     , callBudget = Llm.backgroundBudget
-    , callReply = mapReply normalizeScene (structured @Scene "scene")
+    -- Both repairs run before the reply is ever stored, so what lands in @perception@ and
+    -- @raw_perception@ alike is already in the domain's vocabulary: behaviours consistent
+    -- with the activity, and every subject a species rather than a pet's name.
+    , callReply = mapReply (normalizeScene . resolvePetNames roster) (structured @Scene "scene")
     }
   where
     prompt = visionInstructions brief <> clipNote
@@ -54,7 +60,9 @@ visionInstructions brief =
     [ "You are a home pet-monitoring assistant analysing one or more camera frames."
     , brief
     , "Report ONLY what is actually visible; never guess. Produce one entry in \"appearances\" per visible animal or person."
-    , "Identify a household pet only when the visible traits make it unambiguous. Under night vision or infrared the image is black and white, so DO NOT rely on colour: identify by size, build, shape, ears, tail, gait, and the guide above. If two or more pets could match, describe it by species and lower the confidence."
+    , "Put the SPECIES in \"who\" and, when you can tell WHICH household pet it is, its name from the guide above in \"pet\". Both, not one or the other: \"who\" is always the species, and \"pet\" is null whenever you cannot say which one."
+    , "Identify a household pet only when the visible traits make it unambiguous. Under night vision or infrared the image is black and white, so DO NOT rely on colour: identify by size, build, shape, ears, tail, gait, and the guide above. If two or more pets could match, leave \"pet\" null and lower the confidence."
+    , "Where the household keeps several pets of one species, telling them apart is the whole job of \"pet\": name each one separately when a frame holds more than one."
     , "If a pet's note explains a normal condition (a missing limb, a healed scar, a permanent squint or tremor), treat it as normal for that pet: never report it as an injury, a limp, or a concern; you may use it to identify the pet."
     , "If no animal or person is visible, use an empty \"appearances\" list."
     , "If the frame is dark, blurred, in night/IR mode, or shows only part of an animal, lower the confidence and prefer the activity \"unclear\" over a confident guess."
@@ -63,8 +71,8 @@ visionInstructions brief =
     , "Fill \"description\" with one neutral, specific sentence for the whole scene (never blank or null); vary the wording and do not begin with \"The image shows\"."
     , "Examples of the expected JSON:"
     , "- Empty room: {\"appearances\": [], \"description\": \"The room is empty.\", \"wellbeing\": \"normal\", \"confidence\": 0.95}"
-    , "- A cat asleep: {\"appearances\": [{\"who\": \"cat\", \"activity\": \"sleeping\", \"behaviors\": {\"ate\": false, \"drank\": false, \"slept\": true, \"played\": false, \"groomed\": false, \"concerns\": []}, \"where\": \"on the sofa\"}], \"description\": \"A cat is asleep on the sofa.\", \"wellbeing\": \"normal\", \"confidence\": 0.9}"
-    , "- Two animals in night vision, unsure which pets: {\"appearances\": [{\"who\": \"dog\", \"activity\": \"walking\", \"behaviors\": {\"ate\": false, \"drank\": false, \"slept\": false, \"played\": false, \"groomed\": false, \"concerns\": []}}, {\"who\": \"cat\", \"activity\": \"standing\", \"behaviors\": {\"ate\": false, \"drank\": false, \"slept\": false, \"played\": false, \"groomed\": false, \"concerns\": []}}], \"description\": \"A dog and a cat move through a dim, infrared-lit room.\", \"wellbeing\": \"normal\", \"confidence\": 0.4}"
+    , "- A recognised pet asleep: {\"appearances\": [{\"who\": \"cat\", \"pet\": \"Mochi\", \"activity\": \"sleeping\", \"behaviors\": {\"ate\": false, \"drank\": false, \"slept\": true, \"played\": false, \"groomed\": false, \"concerns\": []}, \"where\": \"on the sofa\"}], \"description\": \"Mochi is asleep on the sofa.\", \"wellbeing\": \"normal\", \"confidence\": 0.9}"
+    , "- Two animals in night vision, unsure which pets: {\"appearances\": [{\"who\": \"dog\", \"pet\": null, \"activity\": \"walking\", \"behaviors\": {\"ate\": false, \"drank\": false, \"slept\": false, \"played\": false, \"groomed\": false, \"concerns\": []}}, {\"who\": \"cat\", \"pet\": null, \"activity\": \"standing\", \"behaviors\": {\"ate\": false, \"drank\": false, \"slept\": false, \"played\": false, \"groomed\": false, \"concerns\": []}}], \"description\": \"A dog and a cat move through a dim, infrared-lit room.\", \"wellbeing\": \"normal\", \"confidence\": 0.4}"
     ]
 
 -- | Draft an identification-grade physical description of one pet from a single

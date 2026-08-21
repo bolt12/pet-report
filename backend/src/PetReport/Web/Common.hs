@@ -131,14 +131,23 @@ toDayStat roster (key, ps) =
 momentViewsByIds :: App -> UTCTime -> Profile -> [Int64] -> IO [ObsView]
 momentViewsByIds app now prof oids = do
   obsById <- Db.getObservationsByIds (appDb app) oids
-  ov <- Db.overridesForObsIds (appDb app) oids
+  ov <- Db.countedAttributionsForObsIds (appDb app) oids
   let obss = [o | i <- oids, Just o <- [Map.lookup i obsById]]
   buildObsViews app now prof mempty ov obss
 
 -- | The single-moment read path: enrich one stored observation into an 'ObsView', or
 -- 'Nothing' if the id is unknown.
+--
+-- Reads its attributions through 'Db.allAttributionsForObs' rather than the batch reader the lists
+-- use, because this is what the moment viewer opens, and the viewer is the one screen whose
+-- job is to settle a naming the model was unsure of. Hiding that guess here would show the
+-- owner "Yuki or Rex" on the very screen built to ask which, while the guess sat in the
+-- database unread.
 obsViewOf :: App -> UTCTime -> Profile -> Int64 -> IO (Maybe ObsView)
-obsViewOf app now prof oid = listToMaybe <$> momentViewsByIds app now prof [oid]
+obsViewOf app now prof oid = do
+  obsById <- Db.getObservationsByIds (appDb app) [oid]
+  ov <- Db.allAttributionsForObs (appDb app) oid
+  listToMaybe <$> buildObsViews app now prof mempty ov [o | Just o <- [Map.lookup oid obsById]]
 
 -- | Run a database action reporting success: 200 @{ok:true}@ on 'True', 404 on 'False'.
 okOr404 :: Text -> IO Bool -> Handler OkResp

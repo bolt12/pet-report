@@ -20,6 +20,7 @@ module PetReport.Effect.Db.Browse
   , decodeCursor
   , browseMoments
   , emptyBrowseQuery
+  , escapeLike
   ) where
 
 import           Data.Either                    (partitionEithers)
@@ -35,7 +36,8 @@ import           Database.SQLite.Simple.ToField (toField)
 import           Text.Read                      (readMaybe)
 
 import           PetReport.Domain.Observation   (Observation)
-import           PetReport.Domain.Types         (Activity, Wellbeing,
+import           PetReport.Domain.Perception    (safetySoundLabels)
+import           PetReport.Domain.Types         (Activity, Wellbeing (..),
                                                  activityText, wellbeingText)
 import           PetReport.Effect.Db.Handle     (Handle (..), withConn)
 import           PetReport.Effect.Db.Queries    (ObsRow, obsRowId, obsRowTs,
@@ -212,7 +214,7 @@ decodeCursor t = case T.splitOn ":" t of
 -- The facet total is computed only on the first, cursorless page.
 browseMoments :: Handle -> BrowseQuery -> IO BrowsePage
 browseMoments h bq = withConn h $ \c -> do
-  let base = baseFacets bq
+  let base = Just (readableRow, []) : baseFacets bq
       (whereBase, bindsBase) = assembleWhere base
       (whereFull, bindsFull) = assembleWhere (base ++ [cursorFacet (bqSort bq) (bqCursor bq)])
       dir = case bqSort bq of Asc -> "ASC"; Desc -> "DESC"
@@ -251,6 +253,21 @@ browseMoments h bq = withConn h $ \c -> do
           IO [Only Int]
       pure (Just (maybe 0 fromOnly (listToMaybe cnt)))
   pure (BrowsePage items nextC total)
+
+-- | The rows 'PetReport.Effect.Db.Queries.rowToObs' can actually decode, as a predicate both
+-- the page and the count carry.
+--
+-- The page partitions undecodable rows out and traces them; the count did not know about
+-- them, so a corrupt row left the header saying "20 moments" above a list of 19, with
+-- nothing on screen to explain the difference and no page that would ever produce the
+-- twentieth. Structural corruption is what the decoder rejects, and it is expressible here;
+-- a blob that parses as SQL JSON but not as a 'Perception' still slips past, and is still
+-- traced.
+readableRow :: Text
+readableRow =
+  "(o.source = 'sample' \
+  \ OR (o.source = 'event' AND o.event_id IS NOT NULL AND o.label IS NOT NULL AND o.score IS NOT NULL)) \
+  \AND json_valid(o.perception)"
 
 -- | The o.-qualified projection, in the exact column order 'rowToObs' decodes.
 selectCols :: Text
@@ -292,14 +309,28 @@ baseFacets bq =
   -- what lets the Today "N to check" badge open exactly the moments it counted rather than
   -- the wider needs-a-look backlog. Unindexed, which is fine at household scale.
   , bqWellbeing bq <&> \wb ->
-      ( "json_extract(o.perception, '$.scene.wellbeing') = ?"
-      , [toField (wellbeingText wb)]
-      )
+      let sceneArm = ("json_extract(o.perception, '$.scene.wellbeing') = ?", [toField (wellbeingText wb)])
+       in case wb of
+            -- A safety sound has no scene, so json_extract reads NULL and the arm above can
+            -- never match it, yet 'PetReport.Domain.Stats.wellbeingOf' calls it concerning
+            -- and the card shows it as such. The Today "N to check" badge counted those and
+            -- then opened a shorter list. Both readers now select the same sounds, off the
+            -- one label list they share.
+            Concerning ->
+              ( "(" <> fst sceneArm <> " OR json_extract(o.perception, '$.sound') IN " <> placeholders (length safetySoundLabels) <> ")"
+              , snd sceneArm ++ map toField safetySoundLabels
+              )
+            -- Every other wellbeing is a scene's own word; a sound carries none at all, so
+            -- widening these would select sounds no card ever labels that way.
+            _ -> sceneArm
   -- Free-text search: an approximate match over the moment's description, subjects,
   -- species, activity and sound text, all of which live in the perception blob. Room has
   -- its own facet. Crude, but it holds up at household scale.
   , bqSearch bq <&> \q ->
-      ("o.perception LIKE ?", [toField ("%" <> q <> "%")])
+      -- ESCAPE, because LIKE reads % and _ as wildcards and the box takes whatever the owner
+      -- types. Without it "100%" matched every moment and "_" matched all of them too, which
+      -- reads as a broken search rather than as a syntax nobody was told about.
+      ("o.perception LIKE ? ESCAPE '\\'", [toField ("%" <> escapeLike q <> "%")])
   , bqMedia bq <&> \case
       -- Mirrors 'PetReport.Domain.View.mediaFor', which dispatches on the perception: a
       -- 'Heard' sound is audio, a 'Seen' scene is photo or clip. So the facet keys off the
@@ -330,6 +361,11 @@ baseFacets bq =
     -- moment must satisfy EVERY subject named, so "Mochi and a person" returns the frames
     -- that hold both rather than either.
     ++ map (Just . subjectFacet) (bqSubjects bq)
+
+-- | Neutralise the LIKE wildcards in owner-typed search text, so it matches literally.
+-- The escape character itself goes first, or escaping the others would double-escape it.
+escapeLike :: Text -> Text
+escapeLike = T.replace "%" "\\%" . T.replace "_" "\\_" . T.replace "\\" "\\\\"
 
 -- | The EXISTS fragment for one subject filter.
 subjectFacet :: SubjectFilter -> (Text, [SQLData])

@@ -61,7 +61,7 @@ import           PetReport.Domain.PetReport    (BalanceV (..), PetInsights (..),
                                                 Spot (..), WellbeingV (..),
                                                 insightsFor)
 import           PetReport.Domain.Profile      (Overrides, Pet (..), Profile,
-                                                activePets, cameras,
+                                                Roster, activePets, cameras,
                                                 enabledCameras, gcWindowDays, pets)
 import           PetReport.Domain.Report       (Period (..), Report (..))
 import           PetReport.Domain.Stats        (SubjectKey (..),
@@ -523,7 +523,7 @@ analyzeQueue app budget prof =
           case mjpg of
             Nothing -> pure ()
             Just jpg -> do
-              mscene <- Vision.analyze (appLlm app) brief [jpg]
+              mscene <- Vision.analyze (appLlm app) (pets prof) brief [jpg]
               case mscene of
                 -- Unparsed response, so leave the frame queued to retry. pruneQueue caps
                 -- genuinely-stuck frames, so they cannot linger forever.
@@ -531,7 +531,7 @@ analyzeQueue app budget prof =
                 Just scene
                   | hasPet scene -> do
                       moveToProof cfg cam fname
-                      Db.insertObservation (appDb app) (sampleObs ts cam scene)
+                      Db.insertObservation (appDb app) (pets prof) (sampleObs ts cam scene)
                   | otherwise -> removeQuiet qpath
 
 sampleObs :: Integer -> Text -> Scene -> NewObservation
@@ -733,7 +733,7 @@ ingestWindow app budget prof lo hi
                 if not ok
                   then pure (seen, wm, True)
                   else do
-                    stored <- ingestOne app brief ev
+                    stored <- ingestOne app (pets prof) brief ev
                     if stored
                       then pure (Map.insert key (feStart ev) seen, adv wm, frozen)
                       else
@@ -751,11 +751,11 @@ ingestWindow app budget prof lo hi
 -- nothing to analyse, so the watermark may advance past it. 'False' means a transient
 -- failure, media not ready or an unparsed model response, so the fold freezes below it and
 -- the event is re-fetched next pass.
-ingestOne :: App -> Text -> FrigateEvent -> IO Bool
-ingestOne app brief ev
+ingestOne :: App -> Roster -> Text -> FrigateEvent -> IO Bool
+ingestOne app roster brief ev
   -- An audio detection stores directly as a sound observation, with no vision call.
   | feLabel ev `elem` cfgAudioLabels (appConfig app) = do
-      Db.insertObservation (appDb app) (soundObs ev)
+      Db.insertObservation (appDb app) roster (soundObs ev)
       pure True
   | otherwise = case Frigate.eventMedia ev of
       -- Frigate reports no snapshot and no clip. A COMPLETED event has nothing to analyse,
@@ -781,11 +781,11 @@ ingestOne app brief ev
           -- written yet. A genuine transient, so freeze and retry within the window.
           then pure False
           else do
-            mscene <- Vision.analyze (appLlm app) brief frames
+            mscene <- Vision.analyze (appLlm app) roster brief frames
             case mscene of
               Nothing -> pure False
               Just scene -> do
-                Db.insertObservation (appDb app) (eventObs ev scene)
+                Db.insertObservation (appDb app) roster (eventObs ev scene)
                 pure True
 
 soundObs :: FrigateEvent -> NewObservation

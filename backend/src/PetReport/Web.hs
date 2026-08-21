@@ -53,7 +53,8 @@ import           Network.HTTP.Types.Status     (status500, statusCode)
 import           Network.Wai                   (Middleware, Response,
                                                 rawPathInfo, requestMethod,
                                                 responseLBS, responseStatus)
-import           PetReport.App                 (App (..), appJobs)
+import           PetReport.App                 (App (..), RepairScope (..),
+                                                appJobs, repairStoredPetNames)
 import           PetReport.Config              (Config (..), parseListen,
                                                 portNumber)
 import           PetReport.Domain.Profile      (Pet, Profile (..),
@@ -64,14 +65,14 @@ import           PetReport.Domain.Window       (localDayOf)
 import qualified PetReport.Effect.Clock        as Clock
 import qualified PetReport.Effect.Db           as Db
 import qualified PetReport.Effect.Frigate      as Frigate
-import           PetReport.Error               (errorEnvelope)
+import           PetReport.Error               (envelopeFormatters, errorEnvelope)
 import qualified PetReport.Analysis.IdentGuide as IdentGuide
 import qualified PetReport.Pipeline            as Pipeline
 import           PetReport.Pipeline.Retention  (runRetentionPoller)
 import           PetReport.Pipeline.Scheduler  (runBatchScheduler,
                                                 runCaptureScheduler)
 import           PetReport.Pipeline.Worker     (Job (..), runJobs)
-import           PetReport.Trace               (WebEvent (..), Tracer,
+import           PetReport.Trace               (Tracer, WebEvent (..),
                                                 pipelineTracer, traceWith,
                                                 webTracer)
 import           PetReport.Web.Cameras
@@ -131,6 +132,9 @@ type MomentsAPI =
   :<|> "api" :> "moments" :> Capture "id" Int64 :> "sightings" :> Capture "ix" Int :> "correction" :> ReqBody '[JSON] CorrectReq :> Post '[JSON] OkResp
   :<|> "api" :> "moments" :> Capture "id" Int64 :> "sightings" :> Capture "ix" Int :> "edit"       :> ReqBody '[JSON] EditReq :> Post '[JSON] OkResp
   :<|> "api" :> "moments" :> Capture "id" Int64 :> "revert"      :> Post '[JSON] OkResp
+  -- Take back the verdict without throwing the owner's corrections away. The narrower
+  -- half of revert, and the one an accidental "that's right" wants.
+  :<|> "api" :> "moments" :> Capture "id" Int64 :> "unreview"    :> Post '[JSON] OkResp
   :<|> "api" :> "moments" :> Capture "id" Int64 :> "keepsake"    :> ReqBody '[JSON] KeepsakeReq :> Post '[JSON] Db.Keepsake
   :<|> "api" :> "moments" :> Capture "id" Int64 :> "transcript"  :> Post '[JSON] Value
   :<|> "api" :> "moments" :> Capture "id" Int64                  :> Get '[JSON] ObsView
@@ -211,6 +215,7 @@ server app =
     :<|> correctH app
     :<|> editH app
     :<|> revertH app
+    :<|> unreviewH app
     :<|> keepsakeAddH app
     :<|> transcribeH app
     :<|> observationH app
@@ -278,6 +283,8 @@ runServer app = do
       (host, port) = case parseListen listen of
         Just (h, p) -> (T.unpack h, portNumber p)
         Nothing     -> ("127.0.0.1", 8116)
+  -- Before anything is served, so no reader sees a species that was really a pet's name.
+  repairStoredPetNames WhenStale app
   traceWith tr (Listening listen)
   -- Every piece of pet-report's automation is a background loop of THIS process, each under
   -- 'withAsync' so shutdown tears it down and 'link' surfaces a loop bug: the job worker for
@@ -300,7 +307,17 @@ runServer app = do
           . setOnExceptionResponse (const internalErrorResponse)
           $ defaultSettings
       )
-      (traceRequests tr (serve (Proxy :: Proxy API) (server app)))
+      -- serveWithContext, only for the error formatters: Servant's own rejections (a
+      -- malformed body, an unparseable query) then answer in the same JSON envelope the
+      -- handlers use, instead of raw parser prose the SPA cannot read.
+      ( traceRequests
+          tr
+          ( serveWithContext
+              (Proxy :: Proxy API)
+              (envelopeFormatters :. EmptyContext)
+              (server app)
+          )
+      )
 
 -- | The response for an uncaught exception on a handler path: our JSON error envelope, so
 -- the SPA renders it like any other error rather than warp's bare 500. 'setOnException' logs

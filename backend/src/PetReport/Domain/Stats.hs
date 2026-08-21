@@ -40,7 +40,7 @@ import           PetReport.Domain.Behavior    (Behaviors (..),
 import           PetReport.Domain.Observation (Observation (..))
 import           PetReport.Domain.Perception  (Appearance (..), Perception (..),
                                                Scene (..), animalSpecies, isPerson,
-                                               isSafetySound)
+                                               isSafetySound, sceneAppearances)
 import           PetReport.Domain.Profile     (Identity (..), Overrides, Pet (..),
                                                Roster, identifyWith)
 import           PetReport.Domain.Types       (Activity (..), ObsId (..), PetId,
@@ -74,9 +74,12 @@ newtype ResolvedStats = ResolvedStats {resolvedStatsMap :: Map SubjectKey PetSta
 newtype StoredStats = StoredStats {storedStatsMap :: Map SubjectKey PetStat}
   deriving stock (Eq, Show)
 
+-- Certainty is deliberately ignored: a sighting the app is willing to attribute to a pet is
+-- one it should also be willing to total for that pet, or the number under a name would
+-- disagree with the cards carrying it.
 keyOf :: Identity -> SubjectKey
 keyOf i = case i of
-  KnownPet p       -> KPet (petId p)
+  KnownPet p _     -> KPet (petId p)
   UnknownAnimal sp -> KSpecies sp
   Visiting sp      -> KVisitor sp
   Human            -> KPerson
@@ -254,9 +257,7 @@ needsLook p = isUncertain p || isConcerning p
 
 -- | The visible appearances of an observation (empty for audio).
 appearancesOf :: Observation -> [Appearance]
-appearancesOf obs = case perception obs of
-  Seen sc -> appearances sc
-  Heard _ -> []
+appearancesOf = sceneAppearances . perception
 
 -- | Resolve every appearance of an observation to its @(Identity, Appearance)@, consulting
 -- owner overrides keyed by @(obs_id, seq)@. The seq addressing happens once here, so callers

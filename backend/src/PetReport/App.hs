@@ -11,6 +11,8 @@ module PetReport.App
   , withApp
   , refreshSettings
   , applyProfile
+  , repairStoredPetNames
+  , RepairScope (..)
   ) where
 
 import           Control.Concurrent.MVar   (MVar, newMVar)
@@ -20,6 +22,8 @@ import           Data.Map.Strict           (Map)
 import           Data.Text                 (Text)
 import qualified Data.Text                 as T
 import           PetReport.Config          (Config (..), loadConfig, orElse)
+import           Control.Monad             (when)
+import qualified PetReport.Analysis.IdentGuide as IdentGuide
 import           PetReport.Domain.Profile  (Profile (..), enabledCameras)
 import           PetReport.Domain.Types    (BaseUrl (..), Camera (..),
                                             ModelName (..))
@@ -187,3 +191,41 @@ applyProfile prof cfg =
       -- cannot ask for a pass rate the scheduler will not honour.
       cfgCaptureSecs = maybe (cfgCaptureSecs cfg) (fromIntegral . max 60) (captureSecs prof)
     }
+
+-- | Fold any stored reading that named a pet where a species belongs back onto that pet's
+-- species, reporting what moved. Both entry points run it: @serve@ before it answers
+-- anything, and @reproject@ before it rebuilds, since a reading folded onto its real species
+-- projects different facts.
+--
+-- Idempotent and silent once clean, so it costs one scan per start and self-heals a roster
+-- renamed after the fact, rather than leaving the owner to know about a CLI command.
+repairStoredPetNames :: RepairScope -> App -> IO ()
+repairStoredPetNames scope app = do
+  prof <- Db.getProfile (appDb app)
+  let fingerprint = IdentGuide.rosterHash prof
+  done <- case scope of
+    Always     -> pure Nothing
+    WhenStale  -> Db.getState (appDb app) repairedKey
+  -- Skip the scan when the roster has not moved since the last clean pass. The work is
+  -- idempotent, so running it every boot was correct and entirely wasted after the first:
+  -- a whole-table read and decode, on the path to accepting connections, discarding all of
+  -- it. Keyed on the roster rather than a bare flag, so renaming a pet still re-runs it,
+  -- which is the one thing that can make a stored reading repairable again. Same shape as
+  -- 'IdentGuide.refreshIfStale', which caches against the same fingerprint.
+  when (done /= Just fingerprint) $ do
+    moved <- Db.repairNamedSpecies (appDb app) (pets prof)
+    when (moved > 0) $
+      traceWith (startupTracer (appTracer app)) (NamedSpeciesRepaired moved)
+    Db.setState (appDb app) repairedKey fingerprint
+
+-- | Whether the repair may trust its own record of having already run.
+--
+-- @serve@ pays this on every boot, so it takes the cached answer; @reproject@ is the command
+-- an owner runs BECAUSE they want the work done again, and a cache that could refuse them is
+-- the one thing it must not be.
+data RepairScope = WhenStale | Always
+  deriving stock (Eq, Show)
+
+-- | The @state@ key holding the roster fingerprint the pet-name repair last ran clean for.
+repairedKey :: Text
+repairedKey = "pet_name_repair_roster"

@@ -74,6 +74,9 @@ data StartupEvent
   -- ^ A startup configuration problem (fatal); one per problem found.
   | Reprojected Int
   -- ^ The @reproject@ command rebuilt the facts projection from N observations.
+  | NamedSpeciesRepaired Int
+  -- ^ N stored sightings named a household pet where a species belongs and were folded onto
+  -- that pet's species. Zero is the steady state, so this only appears when it did work.
   | UnknownLogLevel Text
   -- ^ @PET_REPORT_LOG_LEVEL@ was set to a name that is not a level; 'Info' was used. Carries
   -- the offending value so the owner can see what was ignored.
@@ -217,6 +220,8 @@ renderStartup :: StartupEvent -> WithSeverity Text
 renderStartup e = case e of
   ConfigInvalid m -> WithSeverity Error m
   Reprojected n   -> WithSeverity Info ("reprojected " <> tshow n <> " observations")
+  NamedSpeciesRepaired n ->
+    WithSeverity Info ("repaired " <> tshow n <> " sightings that named a pet instead of a species")
   UnknownLogLevel raw ->
     WithSeverity
       Warning

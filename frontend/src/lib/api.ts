@@ -89,6 +89,9 @@ export interface SubjectRef {
   label: string
   species: string | null
   person: boolean
+  // This pet was named by the vision model, not by you and not by being the only pet of its
+  // species. Shown as unconfirmed, so a guess is never presented as settled fact.
+  byModel: boolean
 }
 
 export type MediaKind = 'photo' | 'clip' | 'audio' | 'expired'
@@ -525,6 +528,9 @@ export const api = {
     post(`/api/moments/${id}/sightings/${ix}/correction`, req).then(ok<{ ok: boolean }>),
   edit: (id: number, ix: number, req: EditReq) =>
     post(`/api/moments/${id}/sightings/${ix}/edit`, req).then(ok<{ ok: boolean }>),
+  // Two different undos. `unreview` takes back the "that's right" and keeps every subject
+  // the owner named; `revert` also throws those away and restores the model's reading.
+  unreview: (id: number) => post(`/api/moments/${id}/unreview`, {}).then(ok<{ ok: boolean }>),
   revert: (id: number) => post(`/api/moments/${id}/revert`, {}).then(ok<{ ok: boolean }>),
   del: (id: number) => del(`/api/moments/${id}`).then(ok<{ ok: boolean }>),
   keep: (id: number, body: { petId?: string; caption?: string }) =>

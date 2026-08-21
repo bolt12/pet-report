@@ -88,6 +88,14 @@
     return 'var(--faint)'
   }
   const max = (xs: number[]) => Math.max(1, ...xs)
+  // A stat with nothing behind it opens an empty list, so it does not open, and says so by
+  // looking inert. Written once: the three tile grids and the spark bar had four copies of
+  // this between them, and the fourth had already lost half the treatment.
+  const inert = (empty: boolean) => ({
+    cls: empty ? 'cursor-default' : 'tappable',
+    style: `background:${empty ? 'transparent' : 'var(--surface)'};border-color:var(--line);color:inherit;opacity:${empty ? 0.55 : 1}`,
+    title: empty ? 'Nothing to show for this one' : 'See those moments',
+  })
 
   // Fetch a moment by id and open it in the lightbox (a keepsake or last-seen only
   // carries an obsId, so the full moment is resolved on demand).
@@ -215,11 +223,14 @@
     <div class="mb-[22px] grid grid-cols-2 gap-[10px] xl:grid-cols-4">
       {#each pet.tiles as t, i (i)}
         {@const empty = t.value === 'no' || t.value === 'none'}
+        <!-- An empty tile is inert, and now looks it. Five identical tiles of which two
+             respond to a tap is a coin toss, under a caption promising all of them do. -->
         <button
           onclick={empty ? undefined : () => reviewFor(pet.id, { from: selYmd(), to: selYmd(), behaviour: behFor(t.label) })}
           disabled={empty}
-          class="{empty ? '' : 'tappable'} rounded-[18px] border p-[14px] text-left"
-          style="background:var(--surface);border-color:var(--line);color:inherit"
+          title={inert(empty).title}
+          class="{inert(empty).cls} rounded-[18px] border p-[14px] text-left"
+          style={inert(empty).style}
         >
           <div class="flex items-baseline justify-between">
             <span class="text-[12.5px] font-bold" style="color:var(--muted)">{t.label}</span>
@@ -239,8 +250,9 @@
           <button
             onclick={empty ? undefined : () => reviewFor(pet.id, { ...monthRange(), behaviour: behFor(s.k) })}
             disabled={empty}
-            class="{empty ? '' : 'tappable'} rounded-[16px] border px-[13px] py-[10px] text-left"
-            style="background:var(--surface);border-color:var(--line);color:inherit"
+            title={inert(empty).title}
+            class="{inert(empty).cls} rounded-[16px] border px-[13px] py-[10px] text-left"
+            style={inert(empty).style}
           >
             <div class="text-[11px] font-bold" style="color:var(--muted)">{s.k}</div>
             <div class="font-head text-[15px] font-semibold" style="color:var(--text)">{s.v}</div>
@@ -260,7 +272,9 @@
         {#each pet.spark as v, i (i)}
           {@const isSel = i === pet.spark.length - 1}
           {@const dOff = day.offset + pet.spark.length - 1 - i}
-          <button onclick={() => reviewFor(pet.id, { from: ymdForOffset(dOff), to: ymdForOffset(dOff) })} class="tappable-bar flex h-full flex-1 items-end" style="border:none;background:none;padding:0" aria-label="See that day's moments">
+          <!-- A bar for a day with no sightings opens an empty list, so it does not open.
+               The tiles above already refuse an empty stat; this is the same rule. -->
+          <button onclick={v === 0 ? undefined : () => reviewFor(pet.id, { from: ymdForOffset(dOff), to: ymdForOffset(dOff) })} disabled={v === 0} class="{v === 0 ? 'cursor-default' : 'tappable-bar'} flex h-full flex-1 items-end" style="border:none;background:none;padding:0" aria-label={v === 0 ? 'Nothing seen that day' : "See that day's moments"}>
             <div
               class="w-full rounded-t-[6px]"
               style="height:{v === 0 ? 4 : 12 + (v / max(pet.spark)) * 40}px;background:{v === 0
@@ -290,8 +304,9 @@
         <button
           onclick={empty ? undefined : () => reviewFor(pet.id, { ...weekRange(), behaviour: behFor(h.label) })}
           disabled={empty}
-          class="{empty ? '' : 'tappable'} flex min-h-[112px] flex-col rounded-[18px] border p-[14px] text-left"
-          style="background:var(--surface);border-color:var(--line);color:inherit"
+          title={inert(empty).title}
+          class="{inert(empty).cls} flex min-h-[112px] flex-col rounded-[18px] border p-[14px] text-left"
+          style={inert(empty).style}
         >
           <div class="text-[12.5px] font-bold" style="color:var(--muted)">{h.label}</div>
           {#if empty}

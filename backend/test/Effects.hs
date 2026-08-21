@@ -52,11 +52,11 @@ import           PetReport.App                (App (..), EffSettings (..), appRe
                                                Runtime (..), appSettings)
 import           PetReport.Config             (Config (..), mkHour, parseListen,
                                                portNumber)
-import           PetReport.Domain.Behavior    (noBehaviors)
 import           PetReport.Domain.Observation (FrigateMeta (..),
                                                NewObservation (..),
                                                Observation (..), Origin (..))
 import           PetReport.Domain.Perception  (Appearance (..), Perception (..),
+                                               anAppearance,
                                                Scene (..), Who (..), emptyScene)
 import           PetReport.Domain.Stats        (appearancesOf)
 import           PetReport.Domain.Report      (Period (..), Report (..))
@@ -336,10 +336,10 @@ runAsk app q = do
 seedTodayObservations :: App -> IO [ObsId]
 seedTodayObservations app = do
   now <- Clock.now (appClock app)
-  let sc = emptyScene {appearances = [Appearance (AnAnimal (Species "cat")) Sleeping noBehaviors Nothing]}
+  let sc = emptyScene {appearances = [(anAppearance (AnAnimal (Species "cat"))) {activity = Sleeping}]}
       obs t = NewObservation t (Camera "office") PeriodicSample (Seen sc)
-  Db.insertObservation (appDb app) (obs (addSecs (-120) now))
-  Db.insertObservation (appDb app) (obs (addSecs (-60) now))
+  Db.insertObservation (appDb app) [] (obs (addSecs (-120) now))
+  Db.insertObservation (appDb app) [] (obs (addSecs (-60) now))
   map obsId <$> Db.observationsBetween (appDb app) (addSecs (-3600) now) (addSecs 3600 now)
 
 -- --------------------------------------------------------------------------- --
@@ -669,14 +669,14 @@ pipelineUnits =
 sceneReply :: Text
 sceneReply =
   TE.decodeUtf8 . LBS.toStrict . encode $
-    emptyScene {appearances = [Appearance (AnAnimal (Species "cat")) Sleeping noBehaviors Nothing]}
+    emptyScene {appearances = [(anAppearance (AnAnimal (Species "cat"))) {activity = Sleeping}]}
 
 -- The same, but the frame holds a person rather than an animal: what a person event's
 -- snapshot analyses to.
 personReply :: Text
 personReply =
   TE.decodeUtf8 . LBS.toStrict . encode $
-    emptyScene {appearances = [Appearance APerson Walking noBehaviors Nothing]}
+    emptyScene {appearances = [(anAppearance APerson) {activity = Walking}]}
 
 -- --------------------------------------------------------------------------- --
 -- (e) Web handlers
@@ -712,9 +712,9 @@ webUnits =
         (\a -> a {appFrigate = fakeFrigate {Frigate.eventSnapshot = \_ -> pure (Just "snap"), Frigate.eventClip = \_ -> pure (Just "clip")}})
         $ \app -> do
           now <- Clock.now (appClock app)
-          let sc = emptyScene {appearances = [Appearance (AnAnimal (Species "cat")) Sleeping noBehaviors Nothing]}
+          let sc = emptyScene {appearances = [(anAppearance (AnAnimal (Species "cat"))) {activity = Sleeping}]}
               ev = NewObservation now (Camera "office") (FromEvent (FrigateMeta (EventId "ev-keep") "cat" 0.9 True True)) (Seen sc)
-          Db.insertObservation (appDb app) ev
+          Db.insertObservation (appDb app) [] ev
           o : _ <- Db.observationsBetween (appDb app) (addSecs (-60) now) (addSecs 60 now)
           let ObsId oid = obsId o
           _ <- runHandler (Web.keepsakeAddH app oid (Web.KeepsakeReq Nothing Nothing))
@@ -737,9 +737,9 @@ webUnits =
                 (addSecs off now)
                 (Camera "office")
                 PeriodicSample
-                (Seen emptyScene {appearances = [Appearance (AnAnimal (Species "cat")) act noBehaviors Nothing]})
-        Db.insertObservation (appDb app) (mk Sleeping 10)
-        Db.insertObservation (appDb app) (mk Playing 20)
+                (Seen emptyScene {appearances = [(anAppearance (AnAnimal (Species "cat"))) {activity = act}]})
+        Db.insertObservation (appDb app) [] (mk Sleeping 10)
+        Db.insertObservation (appDb app) [] (mk Playing 20)
         -- from to subject activity behaviour wellbeing room camera media timeOfDay
         -- review search sort cursor limit
         let browse act =
@@ -755,11 +755,12 @@ webUnits =
               Web.momentsH app Nothing Nothing ss Nothing Nothing Nothing Nothing [] Nothing Nothing Nothing Nothing Nothing Nothing (Just 50)
         Db.insertObservation
           (appDb app)
+          []
           ( NewObservation
               (addSecs 30 now)
               (Camera "office")
               PeriodicSample
-              (Seen emptyScene {appearances = [Appearance APerson Standing noBehaviors Nothing]})
+              (Seen emptyScene {appearances = [(anAppearance APerson) {activity = Standing}]})
           )
         rPerson <- runHandler (subjBrowse [SelPerson])
         (totalOf <$> rPerson) @?= Right (Just 1)

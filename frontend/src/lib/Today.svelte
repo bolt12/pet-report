@@ -22,7 +22,7 @@
   import { live as liveOverlay, openLive, closeLive } from './liveview.svelte'
   import { day } from './day.svelte'
   import { refreshes } from './refresh.svelte'
-  import { greeting, longDate, chipFg, chipStyle, roomTint, fmtTime, friendlyError, frameSrc, ymdForOffset } from './ui'
+  import { greeting, longDate, dayDate, chipFg, chipStyle, roomTint, fmtTime, friendlyError, frameSrc, ymdForOffset } from './ui'
   import { toggleTheme, theme } from './theme.svelte'
   import { layout } from './layout.svelte'
   import { onDestroy } from 'svelte'
@@ -416,7 +416,10 @@
   <div class="flex items-start justify-between gap-[10px] px-[2px] pt-[8px] pb-[14px]">
     <div>
       <div class="font-head text-[27px] leading-[1.05] font-semibold" style="color:var(--text)">{greeting()}</div>
-      <div class="mt-[3px] text-[13px] font-semibold" style="color:var(--muted)">{longDate()}</div>
+      <!-- The date of the day being READ, not the date it happens to be. The greeting is a
+           hello and stays wall-clock, but this line sat above a navigator saying "Mon, Aug
+           17" and read "Friday, August 21", so the screen carried two dates that disagreed. -->
+      <div class="mt-[3px] text-[13px] font-semibold" style="color:var(--muted)">{longDate(dayDate(day.offset))}</div>
     </div>
     <!-- theme + settings live in the sidebar on desktop, so hide them here -->
     <div class="flex flex-shrink-0 gap-[8px] lg:hidden">

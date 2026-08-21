@@ -157,7 +157,9 @@
     { key: 'today', label: 'Today' },
     { key: 'pets', label: 'Pets' },
     { key: 'ask', label: 'Ask' },
-    { key: 'review', label: 'Review' },
+    // "Moments", matching the screen's own title and the desktop sidebar. The tab used to
+    // say "Review", so the same destination had two names depending on where you tapped it.
+    { key: 'review', label: 'Moments' },
   ]
 </script>
 

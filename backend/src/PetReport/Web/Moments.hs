@@ -10,6 +10,7 @@ module PetReport.Web.Moments
   , removeSightingH
   , editH
   , revertH
+  , unreviewH
   , deleteH
   , deleteMomentsH
   , transcribeH
@@ -18,6 +19,7 @@ module PetReport.Web.Moments
 import           Control.Monad.IO.Class   (liftIO)
 import           Data.Aeson               (Value, object, (.=))
 import           Data.Int                 (Int64)
+import           Data.Maybe               (maybeToList)
 import           Data.Text                (Text)
 import qualified Data.Text                as T
 import           Data.Time                (UTCTime)
@@ -32,7 +34,8 @@ import           PetReport.Domain.Profile     (CameraRoom (..), Profile (..),
                                                resolveCorrection)
 import           PetReport.Domain.Types       (ObsId (..))
 import           PetReport.Domain.View        (ObsView)
-import           PetReport.Domain.Window      (Window (..), parseWindow)
+import           PetReport.Domain.Window      (Window (..), parseWindow,
+                                               recognizedArg)
 import qualified PetReport.Effect.Db          as Db
 import qualified PetReport.Effect.Frigate     as Frigate
 import           PetReport.Error              (badInput, notFound)
@@ -67,10 +70,20 @@ momentsH ::
   Handler Value
 momentsH app mfrom mto msubjs mact mbeh mwb mroom mcams mmedia mtod mreview msearch msort mcursor mlimit = do
   (now, tz, prof) <- liftIO (nowTzProfile app)
+  -- Reject a date this cannot read, as every other date-taking handler already does.
+  -- 'parseWindow' falls back to today for anything unrecognised, so a mistyped from/to used
+  -- to answer 200 with today's moments, or none: a wrong answer dressed as a right one.
+  mapM_ rejectUnreadableDay (maybeToList mfrom ++ maybeToList mto)
   -- The one facet that needs the roster, and so the one that can still be rejected here
   -- rather than by the parser. Several are AND-ed: "Mochi and a person" returns the frames
   -- holding both, not either.
   subjs <- either badInput pure (traverse (resolveSubject prof) msubjs)
+  -- A cursor this cannot read used to be dropped, so "load more" quietly served page one
+  -- again: the same moments appended below themselves, for as long as the caller kept
+  -- asking. Say so instead.
+  cursor <- case mcursor of
+    Nothing -> pure Nothing
+    Just raw -> maybe (badInput "invalid cursor") (pure . Just) (Db.decodeCursor raw)
   liftIO $ do
     let (bqf, bqt) = case (mfrom, mto) of
           (Nothing, Nothing) -> (Nothing, Nothing)
@@ -94,17 +107,24 @@ momentsH app mfrom mto msubjs mact mbeh mwb mroom mcams mmedia mtod mreview msea
             , Db.bqMedia = (\(MediaSel m) -> m) <$> mmedia
             , Db.bqTimeOfDay = (\(TimeOfDaySel tb) -> (tb, tzOffsetSecs tz now)) <$> mtod
             , Db.bqSort = maybe Db.Desc (\(SortSel s) -> s) msort
-            , Db.bqCursor = mcursor >>= Db.decodeCursor
+            , Db.bqCursor = cursor
             , Db.bqLimit = maybe 50 (max 1 . min 200) mlimit
             }
     runBrowse app now prof bq
+
+-- | Reject a day argument 'parseWindow' cannot read, in the guard form and with the wording
+-- every other date-taking handler uses.
+rejectUnreadableDay :: Text -> Handler ()
+rejectUnreadableDay d
+  | recognizedArg d = pure ()
+  | otherwise = badInput "invalid day"
 
 -- | Run an assembled browse and render its page, shared by the handler above.
 runBrowse :: App -> UTCTime -> Profile -> Db.BrowseQuery -> IO Value
 runBrowse app now prof bq = do
   page <- Db.browseMoments (appDb app) bq
   let obss = Db.bpItems page
-  ov <- Db.overridesForObsIds (appDb app) [oid | o <- obss, let ObsId oid = obsId o]
+  ov <- Db.countedAttributionsForObsIds (appDb app) [oid | o <- obss, let ObsId oid = obsId o]
   views <- buildObsViews app now prof mempty ov obss
   pure $
     object $
@@ -145,11 +165,22 @@ correctH app oid ix cr = do
 
 -- | Record a subject the model missed. Appends a sighting, so every existing index and the
 -- overrides written against them stay valid.
+--
+-- A frame already at the cap answers 400 rather than 404: nothing is missing, the request
+-- is simply one too many, and an owner told "not found" about a moment they are looking at
+-- learns nothing.
 addSightingH :: App -> Int64 -> AddSightingReq -> Handler OkResp
-addSightingH app oid req =
-  okOr404
-    "moment not found, or it is a sound with no sightings"
-    (Db.addObservationSighting (appDb app) oid (addedSighting req))
+addSightingH app oid req = do
+  outcome <- liftIO (Db.addObservationSighting (appDb app) oid (addedSighting req))
+  case outcome of
+    Db.Added -> pure (OkResp True)
+    Db.TooManySightings ->
+      badInput
+        ( "This moment already holds "
+            <> T.pack (show (Db.maxSightingsPerMoment :: Int))
+            <> " subjects, which is as many as one can. Remove one before adding another."
+        )
+    Db.NoSightingsHere -> notFound "moment not found, or it is a sound with no sightings"
 
 -- | Drop a subject the model invented. The identity overrides are renumbered with it.
 removeSightingH :: App -> Int64 -> Int -> Handler OkResp
@@ -166,7 +197,18 @@ editH app oid ix (EditReq e) =
 -- | Undo the owner's review or correction of a moment, reverting to the model's original
 -- reading and marking it unreviewed so it can be looked at afresh. 404 for an unknown id.
 revertH :: App -> Int64 -> Handler OkResp
-revertH app oid = okOr404 "observation not found" (Db.revertObservation (appDb app) oid)
+revertH app oid = do
+  prof <- liftIO (Db.getProfile (appDb app))
+  okOr404 "observation not found" (Db.revertObservation (appDb app) (pets prof) oid)
+
+-- | Take back the owner's "that's right" while keeping everything else they said: the
+-- subjects they named, added or removed all stand. 404 for an unknown id.
+--
+-- The narrower half of 'revertH', which also restores the model's reading. An owner who
+-- confirmed a moment by mistake wants this one; while it did not exist, the only way to
+-- unmark a moment also discarded the corrections that earned the mark.
+unreviewH :: App -> Int64 -> Handler OkResp
+unreviewH app oid = okOr404 "observation not found" (Db.unreviewObservation (appDb app) oid)
 
 deleteH :: App -> Int64 -> Handler OkResp
 deleteH app oid =

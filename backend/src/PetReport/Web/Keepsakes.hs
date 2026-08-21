@@ -24,6 +24,7 @@ import           PetReport.Domain.Profile     (Profile (..))
 import           PetReport.Domain.Types       (EventId (..))
 import           PetReport.Domain.View        (proofRetainDays)
 import qualified PetReport.Effect.Clock       as Clock
+import           PetReport.Error              (notFound)
 import qualified PetReport.Effect.Db          as Db
 import qualified PetReport.Effect.Frigate     as Frigate
 import           PetReport.View.Enrich        (mkKeepsake)
@@ -53,11 +54,18 @@ keepsakesH app mpet = liftIO $ do
 -- the still and clip out of Frigate while they still exist, so the keepsake outlives
 -- Frigate's retention.
 keepsakeAddH :: App -> Int64 -> KeepsakeReq -> Handler Db.Keepsake
-keepsakeAddH app oid kr = liftIO $ do
-  now <- Clock.now (appClock app)
-  k <- Db.insertKeepsake (appDb app) oid (krPetId kr) (krCaption kr) now
-  ownKeptMedia app oid
-  pure k
+keepsakeAddH app oid kr = do
+  -- Check the moment exists before writing. Without this the insert hit the keepsakes
+  -- foreign key and the exception surfaced as a bare 500 "something went wrong", which
+  -- describes a broken server rather than a moment that is not there.
+  known <- liftIO (Db.getObservation (appDb app) oid)
+  case known of
+    Nothing -> notFound "moment not found"
+    Just _ -> liftIO $ do
+      now <- Clock.now (appClock app)
+      k <- Db.insertKeepsake (appDb app) oid (krPetId kr) (krCaption kr) now
+      ownKeptMedia app oid
+      pure k
 
 -- | Un-keep a moment: delete the keepsake and drop the owned copy of its media, reverting
 -- the moment to borrowed, retention-bound Frigate media.

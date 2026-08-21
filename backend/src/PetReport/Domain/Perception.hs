@@ -6,10 +6,13 @@ module PetReport.Domain.Perception
   , SoundKind (..)
   , soundPhrase
   , isSafetySound
+  , safetySoundLabels
   , Scene (..)
   , emptyScene
   , normalizeScene
   , Appearance (..)
+  , anAppearance
+  , sceneAppearances
   , Who (..)
   , isPerson
   , animalSpecies
@@ -69,6 +72,15 @@ animalSpecies APerson      = Nothing
 -- retained list. The 'Maybe' forces to its constructor, not its value.
 data Appearance = Appearance
   { who       :: !Who
+  , pet       :: !(Maybe Text)
+  -- ^ Which household pet this is, by name, when the model was sure enough to say. A claim
+  -- about the INDIVIDUAL, where 'who' is only what a camera can perceive.
+  --
+  -- Species alone cannot answer "which of my two dogs is that", and the prompt has always
+  -- asked the model to identify a specific pet when the traits allow. Until this field
+  -- existed the answer had nowhere to go, so it came back inside 'who' and minted a species
+  -- named after the pet. Resolved against the roster at storage, never trusted as a name on
+  -- its own.
   , activity  :: !Activity
   , behaviors :: !Behaviors
   , whereAt   :: !(Maybe Text)
@@ -81,9 +93,27 @@ instance HasCodec Appearance where
     object "Appearance" $
       Appearance
         <$> requiredField "who" "cat / dog / person / other species" .= who
+        -- Optional, so every blob written before the field existed still decodes, and so
+        -- "I cannot tell which one" stays expressible.
+        <*> optionalFieldOrNull "pet" "the household pet's name, only when you are sure which one; null otherwise" .= pet
         <*> requiredField "activity" "the dominant posture or action" .= activity
         <*> requiredField "behaviors" "tracked behaviours for this subject" .= behaviors
         <*> optionalFieldOrNull "where" "location in the room, or null" .= whereAt
+
+-- | The subjects a perception holds: a scene's appearances, and nothing for a sound.
+--
+-- The one place this split is written. It was open-coded at every site that needed it,
+-- including twice inside a single module, each copy a chance for one of them to disagree
+-- about what a sound contains.
+sceneAppearances :: Perception -> [Appearance]
+sceneAppearances (Seen sc) = appearances sc
+sceneAppearances (Heard _) = []
+
+-- | A neutral appearance of @w@: present, with nothing else claimed about it. The owner
+-- asserting presence starts here, and so does any test that only cares who was in frame.
+anAppearance :: Who -> Appearance
+anAppearance w =
+  Appearance {who = w, pet = Nothing, activity = Unclear, behaviors = noBehaviors, whereAt = Nothing}
 
 -- | A visual scene: zero or more per-subject appearances plus scene-level notes.
 -- Strict for the same reason as 'Appearance'; the appearance list forces to its spine.
@@ -162,10 +192,18 @@ soundPhrase (SoundKind l) = case l of
   "bang"           -> "a bang"
   _                -> T.map (\c -> if c == '_' then ' ' else c) l
 
+-- | The raw Frigate audio labels that count as safety-relevant. Named rather than inlined
+-- because two readers need the same list: 'isSafetySound', and the browse's wellbeing facet,
+-- which has to select the same sounds in SQL that 'wellbeingOf' calls concerning on a card.
+-- While the list lived only here, the Today badge counted a smoke alarm its own link could
+-- not retrieve.
+safetySoundLabels :: [Text]
+safetySoundLabels =
+  ["fire_alarm", "smoke_detector", "smoke_alarm", "co_alarm", "siren", "car_alarm", "glass", "shatter", "breaking"]
+
 -- | Safety-relevant sounds that should raise the daily report's alert priority.
 isSafetySound :: SoundKind -> Bool
-isSafetySound (SoundKind l) =
-  l `elem` ["fire_alarm", "smoke_detector", "smoke_alarm", "co_alarm", "siren", "car_alarm", "glass", "shatter", "breaking"]
+isSafetySound (SoundKind l) = l `elem` safetySoundLabels
 
 data Perception
   = Seen Scene
@@ -247,7 +285,7 @@ applyCorrectionAt _ _ p = p
 -- sighting. A sound has no sightings to add to.
 addSighting :: Who -> Perception -> Perception
 addSighting w (Seen sc) =
-  Seen sc {appearances = appearances sc ++ [Appearance w Unclear noBehaviors Nothing]}
+  Seen sc {appearances = appearances sc ++ [anAppearance w]}
 addSighting _ p = p
 
 -- | Drop the sighting at @ix@, for a subject the model invented.
