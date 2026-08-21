@@ -13,9 +13,11 @@ module PetReport.Domain.View
   , viewOf
   , mkViews
   , mediaFor
+  , proofRetainDays
   , RetentionMap
   , momentExpiry
   , subjectLabelOf
+  , subjectRefOf
   , chipsOf
   , fallbackDescription
   ) where
@@ -43,21 +45,31 @@ import           PetReport.Domain.Observation (FrigateMeta (..),
 import qualified PetReport.Domain.Observation as O
 import qualified PetReport.Domain.Perception  as P
 import           PetReport.Domain.Profile     (Overrides, Profile (..), roomOf)
-import           PetReport.Domain.Stats       (identifiedAppearances,
-                                               isUncertain)
+import           PetReport.Domain.Stats       (confidenceOf,
+                                               identifiedAppearances,
+                                               isUncertain, needsLook,
+                                               wellbeingOf)
 import qualified PetReport.Domain.Profile     as Pr
 import           PetReport.Domain.Types       (Camera, EventId (..), ObsId (..),
-                                               activityText,
-                                               cameraText, confidenceValue,
+                                               Species, activityText,
+                                               cameraText,
                                                petIdText, speciesText,
                                                wellbeingText)
-import           PetReport.Util               (capitalize, prefixed)
+import           PetReport.Util               (capitalize, prefixed, tshow)
 
--- | A resolved subject on a card.
+-- | A resolved subject on a card. @srIx@ is the sighting's index within the moment, which
+-- is how a correction addresses it: a frame holding two cats has two refs at 0 and 1, and
+-- naming one of them leaves the other alone.
 data SubjectRef = SubjectRef
-  { srPetId   :: Maybe Text
+  { srIx      :: Int
+  , srPetId   :: Maybe Text
   , srLabel   :: Text
   , srSpecies :: Maybe Text
+  , srPerson  :: Bool
+  , srByModel :: Bool
+  -- ^ This pet was named by the vision model, not by the owner and not by being the only
+  -- pet of its species. The card marks it, so a machine guess is never shown as settled
+  -- fact, and so the row invites the tap that confirms or corrects it.
   }
   deriving stock (Eq, Show, Generic)
 
@@ -165,7 +177,8 @@ viewOf roster ov roomFor mediaOf obs =
   let ObsId oid = O.obsId obs
       m = mediaOf obs
       cam = O.camera obs
-      card lbl subs act loc' chps well conf unc desc =
+      perc = O.perception obs
+      card lbl subs act loc' chps desc =
         ObsView
           { ovId = oid
           , ovAt = O.at obs
@@ -176,9 +189,12 @@ viewOf roster ov roomFor mediaOf obs =
           , ovActivity = act
           , ovWhereAt = loc'
           , ovChips = chps
-          , ovWellbeing = well
-          , ovConfidence = conf
-          , ovUncertain = unc
+          -- Wellbeing, confidence, uncertainty and the review flag all come from a named
+          -- rule over the perception rather than being spelled out per branch, so what a
+          -- card shows and what the stored columns hold cannot drift apart.
+          , ovWellbeing = maybe "none" wellbeingText (wellbeingOf perc)
+          , ovConfidence = confidenceOf perc
+          , ovUncertain = isUncertain perc
           , ovDescription = desc
           , ovMedia = omKind m
           , ovImg = omImg m
@@ -186,49 +202,39 @@ viewOf roster ov roomFor mediaOf obs =
           -- Filled by the web layer from the DB cache (mkViews); the domain view
           -- itself has no transcript, keeping viewOf pure and testable.
           , ovTranscript = Nothing
-          , ovNeedsReview = unc && not (O.reviewed obs)
+          , ovNeedsReview = needsLook perc && not (O.reviewed obs)
           , ovReviewed = O.reviewed obs
           -- Kept-ness and clip expiry are DB/config concerns the pure view does not
           -- carry; 'mkViews' patches them from the kept-set and the retention map.
           , ovKept = False
           , ovClipExpiresAt = Nothing
           }
-   in case O.perception obs of
+   in case perc of
         P.Seen sc ->
           let aps = P.appearances sc
               idents = map fst (identifiedAppearances ov roster obs)
-              subs = map subjectRefOf idents
+              subs = zipWith (subjectRefOf roster) [0 ..] idents
               lbl = subjectLabelOf subs
               baseChips = chipsOf sc
-              -- A reassigned-to-visitor animal reads as a visitor even with no
-              -- person in frame; add the pill unless the person path already did.
+              -- An animal the owner marked as not theirs gets its own pill. This used to
+              -- emit the same "visitor" chip the person path emits, so a card could not say
+              -- whether a human or a neighbour's cat had been through.
               chps =
-                if any isVisitingAnimal idents && not (any ((== "visitor") . chLabel) baseChips)
-                  then baseChips ++ [Chip "visitor" Info]
+                if any isVisitingAnimal idents && not (any ((== "not my pet") . chLabel) baseChips)
+                  then baseChips ++ [Chip "not my pet" Info]
                   else baseChips
               -- Attribute the card's activity/location to the primary animal, so a
-              -- "Visitor + Miso" card is not tagged with the visitor's action;
+              -- "A person + Miso" card is not tagged with the person's action;
               -- fall back to the first appearance for a person-only scene.
               primaryAp = case filter (not . isPersonAp) aps of
                 (a : _) -> Just a
                 []      -> listToMaybe aps
               act = activityText . P.activity <$> primaryAp
               loc = primaryAp >>= P.whereAt
-              conf = confidenceValue <$> P.confidence sc
-              unc = isUncertain (O.perception obs)
               desc = case P.description sc of
                 Just d | not (T.null (T.strip d)) -> d
                 _ -> fallbackDescription lbl act loc (roomFor cam)
-           in card
-                lbl
-                subs
-                act
-                loc
-                chps
-                (wellbeingText (P.wellbeing sc))
-                conf
-                unc
-                (Just desc)
+           in card lbl subs act loc chps (Just desc)
         P.Heard sk ->
           let safety = P.isSafetySound sk
            in card
@@ -237,21 +243,61 @@ viewOf roster ov roomFor mediaOf obs =
                 Nothing
                 Nothing
                 [Chip (if safety then "safety" else "sound") (if safety then Watch else Info)]
-                (if safety then "concerning" else "none")
-                Nothing
-                False
                 (Just ("Heard " <> P.soundPhrase sk))
 
-subjectRefOf :: Pr.Identity -> SubjectRef
-subjectRefOf idn = case idn of
-  Pr.KnownPet p ->
-    SubjectRef (Just (petIdText (Pr.petId p))) (Pr.petName p) (Just (speciesText (Pr.petSpecies p)))
+-- | Render one resolved identity as the card's subject. @roster@ is consulted only for the
+-- unattributed case, to name the pets it could have been.
+subjectRefOf :: Pr.Roster -> Int -> Pr.Identity -> SubjectRef
+subjectRefOf roster ix idn = case idn of
+  Pr.KnownPet p certainty ->
+    base
+      { srPetId = Just (petIdText (Pr.petId p))
+      , srLabel = Pr.petName p
+      , srSpecies = Just (speciesText (Pr.petSpecies p))
+      , srByModel = certainty == Pr.ByModel
+      }
   Pr.UnknownAnimal sp ->
-    SubjectRef Nothing (capitalize (speciesText sp)) (Just (speciesText sp))
+    base {srLabel = ambiguousLabel roster sp, srSpecies = Just (speciesText sp)}
   Pr.Visiting sp ->
-    SubjectRef Nothing ("A visiting " <> speciesText sp) (Just (speciesText sp))
+    base {srLabel = "A visiting " <> speciesText sp, srSpecies = Just (speciesText sp)}
   Pr.Human ->
-    SubjectRef Nothing "Visitor" Nothing
+    -- "A person", never "Visitor": a visiting ANIMAL is the other thing this codebase
+    -- calls a visitor, and one word for two subjects made every card ambiguous.
+    base {srLabel = "A person", srPerson = True}
+  where
+    -- Named fields, not positions. The two flags are adjacent and both 'Bool', which is
+    -- exactly the pair a positional call can transpose in silence; every other wire type
+    -- here is built so that cannot happen.
+    base =
+      SubjectRef
+        { srIx = ix
+        , srPetId = Nothing
+        , srLabel = ""
+        , srSpecies = Nothing
+        , srPerson = False
+        , srByModel = False
+        }
+
+-- | How many candidates a label will name before it gives up and says the species.
+--
+-- Past this the line stops being readable, and the row's own picker carries every name
+-- anyway, so nothing is lost by falling back. Two or three is the household that actually
+-- has this problem.
+maxNamedCandidates :: Int
+maxNamedCandidates = 3
+
+-- | What to call an animal the app could not pin to one pet.
+--
+-- With a single pet of the species this never runs, since 'Pr.identify' resolves it. With
+-- several it used to read as the bare species, which says nothing about the choice being
+-- made and reads as though the app had forgotten there was more than one. Naming the
+-- candidates says what is actually known, and points at the correction.
+ambiguousLabel :: Pr.Roster -> Species -> Text
+ambiguousLabel roster sp = case reverse (map Pr.petName (Pr.activeOfSpecies roster sp)) of
+  -- At least two, and few enough to still read as a sentence. The shape carries that: one
+  -- name and a non-empty rest, bounded. Everything else is the species.
+  final : rest@(_ : _) | length rest < maxNamedCandidates -> T.intercalate ", " (reverse rest) <> " or " <> final
+  _ -> capitalize (speciesText sp)
 
 isVisitingAnimal :: Pr.Identity -> Bool
 isVisitingAnimal (Pr.Visiting _) = True
@@ -260,10 +306,26 @@ isVisitingAnimal _               = False
 isPersonAp :: P.Appearance -> Bool
 isPersonAp = P.isPerson . P.who
 
--- | Join subject labels, e.g. "Visitor + Miso"; empty subjects read "Unclear".
+-- | Join subject labels, e.g. "A person + Miso"; empty subjects read "Unclear".
+--
+-- Repeats are COUNTED, not collapsed: "Miso + 2 people", or "Miso x2" for a frame the model
+-- read as the same animal twice. A plain 'nub' hid exactly the state an owner needs to see
+-- to fix it, so a moment carrying four subjects could read the same as one carrying two,
+-- while the day's per-pet totals counted all four.
 subjectLabelOf :: [SubjectRef] -> Text
-subjectLabelOf []  = "Unclear"
-subjectLabelOf srs = T.intercalate " + " (nub (map srLabel srs))
+subjectLabelOf [] = "Unclear"
+subjectLabelOf srs =
+  T.intercalate " + " [render l (sameLabel l) | l <- nub (map srLabel srs)]
+  where
+    -- Grouped by label, in first-seen order, so the sentence still reads in the order the
+    -- subjects were reported.
+    sameLabel l = filter ((== l) . srLabel) srs
+    render l g
+      | length g <= 1 = l
+      -- "A person x2" is not how anyone says it, and people are the repeat an owner
+      -- actually meets, a sitter and a visitor in one frame.
+      | any srPerson g = tshow (length g) <> " people"
+      | otherwise = l <> " x" <> tshow (length g)
 
 -- | A neutral one-line description synthesised from the structured scene, for when the
 -- model omitted its own and the card still needs a readable line. Prefers the specific
@@ -284,13 +346,18 @@ fallbackDescription subject mAct mWhere room =
       Just w | not (T.null (T.strip w)) -> " " <> T.strip w
       _                                 -> " in the " <> room
 
--- | The status pills for a scene: behaviour facts, then a visitor pill, then a
--- notable pill; deduplicated by label, order preserved.
+-- | The status pills for a scene: behaviour facts from the ANIMAL sightings, then a person
+-- pill, then a notable pill; deduplicated by label, order preserved.
+--
+-- A person's behaviour record is deliberately left out. The model fills one in for every
+-- sighting it reports, person or not, so folding over all of them put a sitter's lunch on
+-- the pet's card as an "ate" pill. The same rule already holds on the write paths, which
+-- refuse to give a person an animal identity.
 chipsOf :: P.Scene -> [Chip]
 chipsOf sc =
   nubBy ((==) `on` chLabel) $
-    concatMap apChips (P.appearances sc)
-      ++ [Chip "visitor" Info | any isPersonAp (P.appearances sc)]
+    concatMap apChips (filter (not . isPersonAp) (P.appearances sc))
+      ++ [Chip "person" Info | any isPersonAp (P.appearances sc)]
       ++ [Chip "notable" Info | notablePresent]
   where
     notablePresent = case P.notable sc of
@@ -331,6 +398,15 @@ concernChip s = case s of
 -- | Per-camera Frigate media retention, in days. Polled into 'PetReport.App.appRetention'
 -- and read here on demand, so a config change needs nothing stored or propagated.
 type RetentionMap = Map Text Double
+
+-- | How long a moment's own proof frame is served before the card reads as "expired", in
+-- days.
+--
+-- A presentation constant, so it lives beside the view code that reads it rather than in
+-- the pipeline module three Web handlers had to import wholesale to reach it. That import
+-- was the one upward reach in an otherwise clean layering.
+proofRetainDays :: Double
+proofRetainDays = 30
 
 -- | Build the day's views, then splice in the DB and config concerns the pure 'viewOf' does
 -- not carry: cached transcripts, whether each moment is kept, and its clip-expiry.

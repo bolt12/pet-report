@@ -5,7 +5,9 @@
 -- queryable columns beside it.
 --
 -- This module is a re-export facade over the submodules ("PetReport.Effect.Db.Handle",
--- ".Migrations", ".Queries", ".Browse", ".Gc", ".Rollup"). Import it, not them.
+-- ".Migrations", ".Queries", ".Browse", ".Gc", ".Rollup", ".State", ".Keepsakes").
+-- Import it, not
+-- them.
 module PetReport.Effect.Db
   ( Handle (..)
   , withHandle
@@ -18,8 +20,8 @@ module PetReport.Effect.Db
   , getObservation
   , getObservationsByIds
   , overridesBetween
-  , overridesForObs
-  , overridesForObsIds
+  , allAttributionsForObs
+  , countedAttributionsForObsIds
   , subjectStatsBetween
   , materializeDay
   , dailyPetStats
@@ -32,15 +34,27 @@ module PetReport.Effect.Db
   , purgePetAndProfile
   , getState
   , setState
+  , getIngestWatermark
+  , setIngestWatermark
+  , getIngestDrained
+  , setIngestDrained
+  , getDaySwept
+  , setDaySwept
   , insertReport
   , reportExists
   , latestReport
   , eventStored
   , recentEventStarts
   , correctObservation
+  , addObservationSighting
+  , removeObservationSighting
   , revertObservation
+  , unreviewObservation
   , editObservation
+  , AddOutcome (..)
+  , maxSightingsPerMoment
   , reprojectAll
+  , repairNamedSpecies
   , correctionStats
   , tsRange
   , obsEventId
@@ -60,9 +74,12 @@ module PetReport.Effect.Db
     -- Faceted, cursor-paged browse
   , browseMoments
   , emptyBrowseQuery
+  , escapeLike
   , BrowseQuery (..)
   , BrowsePage (..)
   , PetFilter (..)
+  , SubjectFilter (..)
+  , Behaviour (..)
   , ReviewFilter (..)
   , MediaKind (..)
   , TimeBucket (..)
@@ -75,42 +92,47 @@ module PetReport.Effect.Db
 import           PetReport.Effect.Db.Browse     (BrowsePage (..), BrowseQuery (..),
                                                  Cursor (..), MediaKind (..),
                                                  PetFilter (..), ReviewFilter (..),
+                                                 SubjectFilter (..), Behaviour (..),
                                                  SortDir (..), TimeBucket (..),
                                                  browseMoments, decodeCursor,
-                                                 emptyBrowseQuery, encodeCursor)
+                                                 emptyBrowseQuery, escapeLike, encodeCursor)
 import           PetReport.Effect.Db.Gc         (collectUnkept, countCollectable,
                                                  hasUnkeptBetween)
 import           PetReport.Effect.Db.Handle     (Handle (..), withHandle)
 import           PetReport.Effect.Db.Migrations (latestSchemaVersion)
 import           PetReport.Effect.Db.Rollup     (dailyPetStats, materializeDay)
-import           PetReport.Effect.Db.Queries    (Keepsake (..), PetSummary (..),
+import           PetReport.Effect.Db.State      (getDaySwept, getIngestDrained,
+                                                 getIngestWatermark, getState,
+                                                 setDaySwept, setIngestDrained,
+                                                 setIngestWatermark, setState)
+import           PetReport.Effect.Db.Keepsakes  (Keepsake (..), PetSummary (..),
+                                                 deleteKeepsake, getPetSummary,
+                                                 insertKeepsake, keptObsIds,
+                                                 keptSampleStamps, listKeepsakes,
+                                                 putPetSummary)
+import           PetReport.Effect.Db.Queries    (addObservationSighting,
                                                  correctObservation,
                                                  correctionStats,
-                                                 deleteKeepsake,
                                                  deleteObservation,
                                                  deleteObservations,
                                                  editObservation, eventStored,
                                                  getObservation,
-                                                 getObservationsByIds,
-                                                 getPetSummary,
-                                                 getProfile, getState,
-                                                 insertKeepsake,
-                                                 insertObservation,
-                                                 insertReport,
-                                                 keptObsIds, keptSampleStamps,
-                                                 latestReport, listKeepsakes,
-                                                 markReviewed,
+                                                 getObservationsByIds, getProfile,
+                                                 insertObservation, insertReport,
+                                                 latestReport, markReviewed,
+                                                 modifyProfile, modifyProfileE,
                                                  obsEventId, observationsBetween,
                                                  overridesBetween,
-                                                 overridesForObs,
-                                                 overridesForObsIds,
-                                                 purgePetAndProfile,
-                                                 modifyProfile, modifyProfileE,
-                                                 putPetSummary,
-                                                 putProfile,
-                                                 recentEventStarts,
-                                                 reportExists, reprojectAll,
-                                                 revertObservation, schemaVersion,
-                                                 setState, setTranscript,
-                                                 subjectStatsBetween, transcriptsFor,
-                                                 tsRange)
+                                                 allAttributionsForObs,
+                                                 countedAttributionsForObsIds,
+                                                 purgePetAndProfile, putProfile,
+                                                 recentEventStarts, reportExists,
+                                                 removeObservationSighting,
+                                                 repairNamedSpecies,
+                                                 reprojectAll, revertObservation,
+                                                 unreviewObservation,
+                                                 AddOutcome (..),
+                                                 maxSightingsPerMoment,
+                                                 schemaVersion, setTranscript,
+                                                 subjectStatsBetween,
+                                                 transcriptsFor, tsRange)

@@ -32,6 +32,7 @@ import           PetReport.Domain.Profile     (CameraRoom (..), Pet (..),
                                                Profile (..), activePets, petById)
 import           PetReport.Domain.Stats       (psSightings)
 import           PetReport.Domain.Trends      (DayTrend)
+import           PetReport.Domain.View        (proofRetainDays)
 import           PetReport.Domain.Types       (PetId (..), Species (..),
                                                petIdText)
 import           PetReport.Domain.Window      (Window (..), localDayOf,
@@ -41,7 +42,6 @@ import qualified PetReport.Effect.Clock       as Clock
 import qualified PetReport.Effect.Db          as Db
 import           PetReport.Error              (AppError (..), badInput, conflict,
                                                notFound, throwAppError)
-import qualified PetReport.Pipeline           as Pipeline
 import           PetReport.Pipeline.Worker    (Job (RefreshBrief), submit)
 import           PetReport.View.Enrich        (mkKeepsake, mkRecap, wellbeingLine)
 import           PetReport.Web.Common         (foundOr404, nowTzProfile,
@@ -118,12 +118,12 @@ enrichInsights app crs now monthTrs (pet, ins) = do
     Nothing -> pure Nothing
     Just k -> do
       mobs <- Db.getObservation (appDb app) (Db.kObsId k)
-      pure (mkKeepsake Pipeline.proofRetainDays crs now k <$> mobs)
+      pure (mkKeepsake proofRetainDays crs now k <$> mobs)
   let monthStat = monthStatFor monthTrs pet
       weekSeen = sum (piSpark ins)
       daysSeen = length (filter (> 0) (piSpark ins))
       topSpot = case piSpots ins of (s : _) -> Just (spRoom s); _ -> Nothing
-      wbLine = wellbeingLine (piName ins) (wbKind (piWellbeing ins)) weekSeen (blRestPct (piBalance ins)) topSpot
+      wbLine = wellbeingLine (piName ins) weekSeen (blRestPct (piBalance ins)) topSpot
   pure
     ins
       { piWellbeing = (piWellbeing ins) {wbText = wbLine}

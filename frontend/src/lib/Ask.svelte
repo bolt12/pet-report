@@ -5,7 +5,7 @@
   import Thumb from './Thumb.svelte'
   import GearButton from './GearButton.svelte'
   import TimeText from './TimeText.svelte'
-  import { fmtTime, friendlyError, ymdForOffset, ymdOf } from './ui'
+  import { fmtWhen, friendlyError, ymdForOffset, ymdOf } from './ui'
 
   let { pets, onnav }: { pets: Pet[]; onnav: (s: string, arg?: string | ReviewPreset) => void } = $props()
 
@@ -113,8 +113,8 @@
           {#each refs as o (o.id)}
             <button onclick={() => openRef(o)} class="flex-shrink-0 rounded-2xl border p-[8px] text-left" style="width:132px;background:var(--surface);border-color:var(--line);color:inherit">
               <div class="relative mb-[7px] h-[78px] overflow-hidden rounded-xl"><Thumb img={o.media.stillUrl} media={o.media.kind} room={o.room} pawSize={26} /></div>
-              <div class="text-[11.5px] font-extrabold" style="color:var(--text)">{fmtTime(o.at)} · {o.room}</div>
-              <div class="mt-[2px] text-[11px]" style="color:var(--muted)">{o.subjectLabel}</div>
+              <div class="text-[11.5px] font-extrabold" style="color:var(--text)">{fmtWhen(o.at)}</div>
+              <div class="mt-[2px] text-[11px]" style="color:var(--muted)">{o.subjectLabel} · {o.room}</div>
             </button>
           {/each}
         </div>

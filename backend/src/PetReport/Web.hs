@@ -39,7 +39,6 @@ import           Control.Monad.IO.Class   (liftIO)
 import           Data.Aeson               (Value, encode, object, (.=))
 import           Data.ByteString          (ByteString)
 import           Data.Int                 (Int64)
-import           Data.Maybe               (fromMaybe)
 import           Data.String              (fromString)
 import           Data.Text                (Text)
 import qualified Data.Text                as T
@@ -54,7 +53,8 @@ import           Network.HTTP.Types.Status     (status500, statusCode)
 import           Network.Wai                   (Middleware, Response,
                                                 rawPathInfo, requestMethod,
                                                 responseLBS, responseStatus)
-import           PetReport.App                 (App (..), appJobs)
+import           PetReport.App                 (App (..), RepairScope (..),
+                                                appJobs, repairStoredPetNames)
 import           PetReport.Config              (Config (..), parseListen,
                                                 portNumber)
 import           PetReport.Domain.Profile      (Pet, Profile (..),
@@ -65,20 +65,21 @@ import           PetReport.Domain.Window       (localDayOf)
 import qualified PetReport.Effect.Clock        as Clock
 import qualified PetReport.Effect.Db           as Db
 import qualified PetReport.Effect.Frigate      as Frigate
-import           PetReport.Error               (errorEnvelope)
+import           PetReport.Error               (envelopeFormatters, errorEnvelope)
 import qualified PetReport.Analysis.IdentGuide as IdentGuide
 import qualified PetReport.Pipeline            as Pipeline
 import           PetReport.Pipeline.Retention  (runRetentionPoller)
 import           PetReport.Pipeline.Scheduler  (runBatchScheduler,
                                                 runCaptureScheduler)
 import           PetReport.Pipeline.Worker     (Job (..), runJobs)
-import           PetReport.Trace               (WebEvent (..), Tracer,
+import           PetReport.Trace               (Tracer, WebEvent (..),
                                                 pipelineTracer, traceWith,
                                                 webTracer)
 import           PetReport.Web.Cameras
 import           PetReport.Web.Cleanup
 import           PetReport.Web.Days
 import           PetReport.Web.Events
+import           PetReport.Web.Facets
 import           PetReport.Web.Keepsakes
 import           PetReport.Web.Moments
 import           PetReport.Web.Ops
@@ -103,17 +104,37 @@ type DaysAPI =
   "api" :> "days" :> Capture "date" Text :> Get '[JSON] DayResponse
 
 type MomentsAPI =
+       -- Every facet has its own type, so an unrecognised token is a 400 naming the legal
+       -- set rather than a silently dropped clause, and two adjacent params can no longer
+       -- be transposed without a compile error.
        "api" :> "moments"
-         :> QueryParam "from" Text      :> QueryParam "to" Text     :> QueryParam "pet" Text
-         :> QueryParam "activity" Text  :> QueryParam "room" Text   :> QueryParam "media" Text
-         :> QueryParam "timeOfDay" Text :> QueryParam "review" Text :> QueryParam "search" Text
-         :> QueryParam "sort" Text      :> QueryParam "cursor" Text :> QueryParam "limit" Int
+         :> QueryParam "from" Text           :> QueryParam "to" Text
+         :> QueryParams "subject" SubjectSel :> QueryParam "activity" ActivitySel
+         :> QueryParam "behaviour" BehaviourSel :> QueryParam "wellbeing" WellbeingSel
+         -- room is a saved label from the profile; camera is the raw id, which is what a
+         -- favourite-spot link carries because its label may be a display-only fallback.
+         :> QueryParam "room" Text           :> QueryParams "camera" Text
+         :> QueryParam "media" MediaSel
+         :> QueryParam "timeOfDay" TimeOfDaySel :> QueryParam "review" ReviewSel
+         :> QueryParam "search" Text         :> QueryParam "sort" SortSel
+         :> QueryParam "cursor" Text         :> QueryParam "limit" Int
          :> Get '[JSON] Value
   :<|> "api" :> "moments" :> "review"                            :> ReqBody '[JSON] ReviewReq :> Post '[JSON] OkResp
   :<|> "api" :> "moments" :> "delete"                            :> ReqBody '[JSON] DeleteMomentsReq :> Post '[JSON] Value
-  :<|> "api" :> "moments" :> Capture "id" Int64 :> "correction"  :> ReqBody '[JSON] CorrectReq :> Post '[JSON] OkResp
-  :<|> "api" :> "moments" :> Capture "id" Int64 :> "edit"        :> ReqBody '[JSON] EditReq :> Post '[JSON] OkResp
+  -- Both address ONE sighting: a moment holding two cats and a sitter is three sightings,
+  -- and each is named and edited on its own. The index is in the path rather than the body
+  -- so it cannot be defaulted away.
+  -- Add a subject the model missed, or drop one it invented. Together with the
+  -- per-sighting correction below, this is what lets a frame hold a pet AND a person
+  -- rather than one or the other.
+  :<|> "api" :> "moments" :> Capture "id" Int64 :> "sightings" :> ReqBody '[JSON] AddSightingReq :> Post '[JSON] OkResp
+  :<|> "api" :> "moments" :> Capture "id" Int64 :> "sightings" :> Capture "ix" Int :> Delete '[JSON] OkResp
+  :<|> "api" :> "moments" :> Capture "id" Int64 :> "sightings" :> Capture "ix" Int :> "correction" :> ReqBody '[JSON] CorrectReq :> Post '[JSON] OkResp
+  :<|> "api" :> "moments" :> Capture "id" Int64 :> "sightings" :> Capture "ix" Int :> "edit"       :> ReqBody '[JSON] EditReq :> Post '[JSON] OkResp
   :<|> "api" :> "moments" :> Capture "id" Int64 :> "revert"      :> Post '[JSON] OkResp
+  -- Take back the verdict without throwing the owner's corrections away. The narrower
+  -- half of revert, and the one an accidental "that's right" wants.
+  :<|> "api" :> "moments" :> Capture "id" Int64 :> "unreview"    :> Post '[JSON] OkResp
   :<|> "api" :> "moments" :> Capture "id" Int64 :> "keepsake"    :> ReqBody '[JSON] KeepsakeReq :> Post '[JSON] Db.Keepsake
   :<|> "api" :> "moments" :> Capture "id" Int64 :> "transcript"  :> Post '[JSON] Value
   :<|> "api" :> "moments" :> Capture "id" Int64                  :> Get '[JSON] ObsView
@@ -189,9 +210,12 @@ server app =
   :<|> ( momentsH app
     :<|> reviewH app
     :<|> deleteMomentsH app
+    :<|> addSightingH app
+    :<|> removeSightingH app
     :<|> correctH app
     :<|> editH app
     :<|> revertH app
+    :<|> unreviewH app
     :<|> keepsakeAddH app
     :<|> transcribeH app
     :<|> observationH app
@@ -223,8 +247,8 @@ server app =
   :<|> proofH app
 
 
--- | The overview: enabled cameras with live online status, the needs-a-look badge count,
--- and the earliest logged day. Reads the profile fresh rather than the startup-baked config,
+-- | The overview: enabled cameras with live online status and the earliest logged day.
+-- Reads the profile fresh rather than the startup-baked config,
 -- so cameras added in setup appear immediately in the long-lived @serve@ process.
 overviewH :: App -> Handler Value
 overviewH app = liftIO $ do
@@ -235,11 +259,6 @@ overviewH app = liftIO $ do
   -- The earliest logged local day, so the client stops the day navigator at the first day
   -- with data instead of a fixed cap. Omitted when there is none.
   mRange <- Db.tsRange (appDb app)
-  -- The global needs-a-look backlog size for the badge, off the browse count path with
-  -- the needs-look facet over a zero-size page.
-  pending <-
-    fromMaybe 0 . Db.bpTotal
-      <$> Db.browseMoments (appDb app) (Db.emptyBrowseQuery {Db.bqReview = Just Db.NeedsLook, Db.bqLimit = 0})
   let earliest = case mRange of
         Just (lo, _) -> ["earliestDay" .= T.pack (show (localDayOf tz lo))]
         Nothing      -> []
@@ -249,7 +268,7 @@ overviewH app = liftIO $ do
           , "room" .= roomOf (cameras prof) (Camera c)
           , "online" .= (c `elem` online)
           ]
-  pure (object (["cameras" .= map one cams, "pendingReview" .= pending] ++ earliest))
+  pure (object (("cameras" .= map one cams) : earliest))
 
 -- --------------------------------------------------------------------------- --
 -- Helpers + runner
@@ -264,6 +283,8 @@ runServer app = do
       (host, port) = case parseListen listen of
         Just (h, p) -> (T.unpack h, portNumber p)
         Nothing     -> ("127.0.0.1", 8116)
+  -- Before anything is served, so no reader sees a species that was really a pet's name.
+  repairStoredPetNames WhenStale app
   traceWith tr (Listening listen)
   -- Every piece of pet-report's automation is a background loop of THIS process, each under
   -- 'withAsync' so shutdown tears it down and 'link' surfaces a loop bug: the job worker for
@@ -286,7 +307,17 @@ runServer app = do
           . setOnExceptionResponse (const internalErrorResponse)
           $ defaultSettings
       )
-      (traceRequests tr (serve (Proxy :: Proxy API) (server app)))
+      -- serveWithContext, only for the error formatters: Servant's own rejections (a
+      -- malformed body, an unparseable query) then answer in the same JSON envelope the
+      -- handlers use, instead of raw parser prose the SPA cannot read.
+      ( traceRequests
+          tr
+          ( serveWithContext
+              (Proxy :: Proxy API)
+              (envelopeFormatters :. EmptyContext)
+              (server app)
+          )
+      )
 
 -- | The response for an uncaught exception on a handler path: our JSON error envelope, so
 -- the SPA renders it like any other error rather than warp's bare 500. 'setOnException' logs

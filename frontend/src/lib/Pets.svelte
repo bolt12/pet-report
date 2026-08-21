@@ -1,5 +1,12 @@
 <script lang="ts">
-  import { api, photoUrlFor, type PetInsights, type Pet, type ReviewPreset } from './api'
+  import {
+    api,
+    photoUrlFor,
+    type BehaviourValue,
+    type Pet,
+    type PetInsights,
+    type ReviewPreset,
+  } from './api'
   import Avatar from './Avatar.svelte'
   import Paw from './Paw.svelte'
   import Thumb from './Thumb.svelte'
@@ -41,25 +48,33 @@
   let watch = $derived(pet?.wellbeing.kind === 'watch')
 
   // --- deep links into Moments -----------------------------------------------
-  // Map a stat's label to a Review "act" facet key, so a tile/habit/month card
-  // opens Moments already filtered to that behaviour.
-  const ACT_BY_LABEL: Record<string, string> = {
+  // Map a stat's label to the behaviour facet it is counted from, so a tile opens exactly
+  // the moments behind its own number.
+  //
+  // These used to map to ACTIVITY values instead: "Meals" counts the `ate` flag but linked
+  // to `activity=eating`, a different set, and "Rest" counts sleeping + resting + sitting
+  // but linked to `activity=resting`, a subset. Every tile therefore opened a list that
+  // disagreed with the figure printed on it. The behaviour facet filters the same column
+  // the statistic sums.
+  const BEH_BY_LABEL: Record<string, BehaviourValue> = {
     Meals: 'ate',
     Water: 'drank',
     Rest: 'rest',
     Rested: 'rest',
-    Litter: 'toilet',
-    Play: 'play',
+    Litter: 'eliminated',
+    Play: 'played',
     Ate: 'ate',
+    Groomed: 'groomed',
+    Slept: 'slept',
   }
-  const actArr = (label: string): string[] | undefined => (ACT_BY_LABEL[label] ? [ACT_BY_LABEL[label]] : undefined)
+  const behFor = (label: string): BehaviourValue | undefined => BEH_BY_LABEL[label]
   // Date ranges relative to the selected day (offset): the day itself, the trailing
   // week, and the trailing 30 days. A single day passes from === to.
   const selYmd = () => ymdForOffset(day.offset)
   const weekRange = (): ReviewPreset => ({ from: ymdForOffset(day.offset + 6), to: ymdForOffset(day.offset) })
   const monthRange = (): ReviewPreset => ({ from: ymdForOffset(day.offset + 29), to: ymdForOffset(day.offset) })
   function reviewFor(petId: string, extra: ReviewPreset) {
-    onnav('review', { who: [petId], ...extra })
+    onnav('review', { subject: [{ kind: 'pet', petId }], ...extra })
   }
 
   function tileGlyph(v: string): string {
@@ -73,6 +88,14 @@
     return 'var(--faint)'
   }
   const max = (xs: number[]) => Math.max(1, ...xs)
+  // A stat with nothing behind it opens an empty list, so it does not open, and says so by
+  // looking inert. Written once: the three tile grids and the spark bar had four copies of
+  // this between them, and the fourth had already lost half the treatment.
+  const inert = (empty: boolean) => ({
+    cls: empty ? 'cursor-default' : 'tappable',
+    style: `background:${empty ? 'transparent' : 'var(--surface)'};border-color:var(--line);color:inherit;opacity:${empty ? 0.55 : 1}`,
+    title: empty ? 'Nothing to show for this one' : 'See those moments',
+  })
 
   // Fetch a moment by id and open it in the lightbox (a keepsake or last-seen only
   // carries an obsId, so the full moment is resolved on demand).
@@ -200,11 +223,14 @@
     <div class="mb-[22px] grid grid-cols-2 gap-[10px] xl:grid-cols-4">
       {#each pet.tiles as t, i (i)}
         {@const empty = t.value === 'no' || t.value === 'none'}
+        <!-- An empty tile is inert, and now looks it. Five identical tiles of which two
+             respond to a tap is a coin toss, under a caption promising all of them do. -->
         <button
-          onclick={empty ? undefined : () => reviewFor(pet.id, { from: selYmd(), to: selYmd(), act: actArr(t.label) })}
+          onclick={empty ? undefined : () => reviewFor(pet.id, { from: selYmd(), to: selYmd(), behaviour: behFor(t.label) })}
           disabled={empty}
-          class="{empty ? '' : 'tappable'} rounded-[18px] border p-[14px] text-left"
-          style="background:var(--surface);border-color:var(--line);color:inherit"
+          title={inert(empty).title}
+          class="{inert(empty).cls} rounded-[18px] border p-[14px] text-left"
+          style={inert(empty).style}
         >
           <div class="flex items-baseline justify-between">
             <span class="text-[12.5px] font-bold" style="color:var(--muted)">{t.label}</span>
@@ -222,10 +248,11 @@
         {#each pet.monthStats as s, i (i)}
           {@const empty = /^0\b/.test(s.v)}
           <button
-            onclick={empty ? undefined : () => reviewFor(pet.id, { ...monthRange(), act: actArr(s.k) })}
+            onclick={empty ? undefined : () => reviewFor(pet.id, { ...monthRange(), behaviour: behFor(s.k) })}
             disabled={empty}
-            class="{empty ? '' : 'tappable'} rounded-[16px] border px-[13px] py-[10px] text-left"
-            style="background:var(--surface);border-color:var(--line);color:inherit"
+            title={inert(empty).title}
+            class="{inert(empty).cls} rounded-[16px] border px-[13px] py-[10px] text-left"
+            style={inert(empty).style}
           >
             <div class="text-[11px] font-bold" style="color:var(--muted)">{s.k}</div>
             <div class="font-head text-[15px] font-semibold" style="color:var(--text)">{s.v}</div>
@@ -245,7 +272,9 @@
         {#each pet.spark as v, i (i)}
           {@const isSel = i === pet.spark.length - 1}
           {@const dOff = day.offset + pet.spark.length - 1 - i}
-          <button onclick={() => reviewFor(pet.id, { from: ymdForOffset(dOff), to: ymdForOffset(dOff) })} class="tappable-bar flex h-full flex-1 items-end" style="border:none;background:none;padding:0" aria-label="See that day's moments">
+          <!-- A bar for a day with no sightings opens an empty list, so it does not open.
+               The tiles above already refuse an empty stat; this is the same rule. -->
+          <button onclick={v === 0 ? undefined : () => reviewFor(pet.id, { from: ymdForOffset(dOff), to: ymdForOffset(dOff) })} disabled={v === 0} class="{v === 0 ? 'cursor-default' : 'tappable-bar'} flex h-full flex-1 items-end" style="border:none;background:none;padding:0" aria-label={v === 0 ? 'Nothing seen that day' : "See that day's moments"}>
             <div
               class="w-full rounded-t-[6px]"
               style="height:{v === 0 ? 4 : 12 + (v / max(pet.spark)) * 40}px;background:{v === 0
@@ -273,10 +302,11 @@
       {#each pet.habits as h, i (i)}
         {@const empty = h.usual === 0 && h.values.every((v) => v === 0)}
         <button
-          onclick={empty ? undefined : () => reviewFor(pet.id, { ...weekRange(), act: actArr(h.label) })}
+          onclick={empty ? undefined : () => reviewFor(pet.id, { ...weekRange(), behaviour: behFor(h.label) })}
           disabled={empty}
-          class="{empty ? '' : 'tappable'} flex min-h-[112px] flex-col rounded-[18px] border p-[14px] text-left"
-          style="background:var(--surface);border-color:var(--line);color:inherit"
+          title={inert(empty).title}
+          class="{inert(empty).cls} flex min-h-[112px] flex-col rounded-[18px] border p-[14px] text-left"
+          style={inert(empty).style}
         >
           <div class="text-[12.5px] font-bold" style="color:var(--muted)">{h.label}</div>
           {#if empty}
@@ -344,7 +374,7 @@
         <div class="mt-[2px] mb-[16px] text-[12.5px]" style="color:var(--muted)">Where {pet.name} likes to be.</div>
         <div class="flex flex-col gap-[12px]">
           {#each pet.spots as sp, i (i)}
-            <button onclick={() => reviewFor(pet.id, { ...weekRange(), room: [sp.room] })} class="flex w-full items-center gap-[12px]" style="border:none;background:none;padding:0;color:inherit">
+            <button onclick={() => reviewFor(pet.id, { ...weekRange(), camera: sp.cameras })} class="flex w-full items-center gap-[12px]" style="border:none;background:none;padding:0;color:inherit">
               <span class="w-[120px] flex-shrink-0 truncate text-left text-[13px] font-bold" style="color:var(--text)">{sp.room}</span>
               <div class="h-[8px] flex-1 overflow-hidden rounded-full" style="background:var(--surface2)">
                 <div class="h-full rounded-full" style="width:{sp.pct}%;background:{i === 0 ? 'var(--accent)' : 'rgba(236,171,130,0.4)'}"></div>

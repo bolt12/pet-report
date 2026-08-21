@@ -14,7 +14,7 @@ import           Data.Time                  (UTCTime)
 
 import           PetReport.Domain.Observation (Observation (..))
 import           PetReport.Domain.PetReport (KeepsakeV (..), RecapV (..),
-                                             StatPair (..), WellbeingKind (..))
+                                             StatPair (..))
 import           PetReport.Domain.Profile   (CameraRoom, roomOf)
 import           PetReport.Domain.View      (ObsMedia (..), mediaFor)
 import qualified PetReport.Effect.Db        as Db
@@ -35,14 +35,18 @@ mkRecap weekSeen daysSeen s = case Db.sumRecap s of
 
 -- | A short wellbeing line built from real signals: sightings this week, rest share,
 -- favourite room. Hidden when the week is too thin to say anything meaningful.
-wellbeingLine :: Text -> WellbeingKind -> Int -> Int -> Maybe Text -> Maybe Text
-wellbeingLine name kind weekSeen restPct topSpot
+--
+-- Deliberately says nothing about being flagged. It used to append "One moment is flagged
+-- for a look", which was false whenever the verdict came from a missed meal rather than a
+-- flagged observation, and sent the owner to a review queue that could be empty. The reason
+-- belongs on the note and glance chips, which name it, so this line stays factual.
+wellbeingLine :: Text -> Int -> Int -> Maybe Text -> Maybe Text
+wellbeingLine name weekSeen restPct topSpot
   | weekSeen < 5 = Nothing
-  | otherwise = Just (base <> spot <> close)
+  | otherwise = Just (base <> spot <> ".")
   where
     base = name <> " was seen " <> sh weekSeen <> " times this week, resting about " <> sh restPct <> "% of the time"
     spot = maybe "" (", most often in the " <>) topSpot
-    close = if kind == Flagged then ". One moment is flagged for a look." else "."
     sh = T.pack . show
 
 -- | Lift a saved keepsake plus its moment into the keepsake view, resolving the moment's

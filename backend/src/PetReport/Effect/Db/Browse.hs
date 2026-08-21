@@ -9,6 +9,8 @@ module PetReport.Effect.Db.Browse
   ( BrowseQuery (..)
   , BrowsePage (..)
   , PetFilter (..)
+  , SubjectFilter (..)
+  , Behaviour (..)
   , ReviewFilter (..)
   , MediaKind (..)
   , TimeBucket (..)
@@ -18,6 +20,7 @@ module PetReport.Effect.Db.Browse
   , decodeCursor
   , browseMoments
   , emptyBrowseQuery
+  , escapeLike
   ) where
 
 import           Data.Either                    (partitionEithers)
@@ -33,6 +36,9 @@ import           Database.SQLite.Simple.ToField (toField)
 import           Text.Read                      (readMaybe)
 
 import           PetReport.Domain.Observation   (Observation)
+import           PetReport.Domain.Perception    (safetySoundLabels)
+import           PetReport.Domain.Types         (Activity, Wellbeing (..),
+                                                 activityText, wellbeingText)
 import           PetReport.Effect.Db.Handle     (Handle (..), withConn)
 import           PetReport.Effect.Db.Queries    (ObsRow, obsRowId, obsRowTs,
                                                  rowToObs)
@@ -52,9 +58,60 @@ data MediaKind = MediaPhoto | MediaClip | MediaAudio
   deriving stock (Eq, Show)
 
 -- | The review facet. @NeedsLook@ is the materialised backlog predicate
--- (@uncertain = 1 AND reviewed = 0@), served by the partial needs-look index.
+-- (@needs_look = 1 AND reviewed = 0@), served by the partial needs-look index. Both
+-- conjuncts must stay bare, literal and AND-joined, or SQLite stops matching that partial
+-- index and silently falls back to a scan.
 data ReviewFilter = Reviewed | Unreviewed | NeedsLook
+  deriving stock (Eq, Show, Enum, Bounded)
+
+-- | The subject facet: what has to be true of a moment's sightings for it to come back.
+--
+-- One closed sum rather than a pet field beside a species field, because the two are the
+-- same question asked at different precision, and because separate optional fields let a
+-- caller ask for a concept the facet cannot express. That is exactly what went wrong: with
+-- only a @pet@ slot available, the day summary's "Someone was home" link had to invent a
+-- pet id of @visitor@, which resolved to a real-looking filter matching no rows. A moment
+-- matches if ANY of its sightings matches, so a frame holding the dog and the sitter is
+-- returned by both 'SubjPerson' and a 'SubjPet' naming the dog.
+data SubjectFilter
+  = SubjPet PetFilter
+  | SubjSpecies Text
+  | SubjPerson
+  | SubjVisiting
   deriving stock (Eq, Show)
+
+-- | The behaviour facet, one constructor per projected behaviour column.
+--
+-- These columns have existed since the initial schema and were read only through @SUM@ in
+-- the statistics queries, never in a predicate. That is why every per-pet tile counted one
+-- thing and drilled through to another: a "Meals" tile counts @SUM(ate)@ but the only
+-- facet available to its link was @activity@, so it opened @activity=eating@, a different
+-- set. Filtering on the same column the tile counts makes the two agree by construction.
+data Behaviour
+  = BehAte
+  | BehDrank
+  | BehSlept
+  | BehPlayed
+  | BehGroomed
+  | BehEliminated
+  | BehRest
+  | BehActive
+  | BehConcern
+  deriving stock (Eq, Show, Enum, Bounded)
+
+-- | The @observation_subjects@ column a behaviour facet tests. Kept beside the constructor
+-- so adding one without wiring its column is a non-exhaustive-match error.
+behaviourColumn :: Behaviour -> Text
+behaviourColumn b = case b of
+  BehAte        -> "ate"
+  BehDrank      -> "drank"
+  BehSlept      -> "slept"
+  BehPlayed     -> "played"
+  BehGroomed    -> "groomed"
+  BehEliminated -> "eliminated"
+  BehRest       -> "rest"
+  BehActive     -> "active"
+  BehConcern    -> "concern"
 
 -- | A time-of-day window as a half-open second range within a local day
 -- @[0, 86400)@. A bucket with @from > to@ wraps midnight (e.g. night).
@@ -94,10 +151,11 @@ data BrowseQuery = BrowseQuery
   { bqFrom      :: !(Maybe UTCTime)
   , bqTo        :: !(Maybe UTCTime)
   , bqReview    :: !(Maybe ReviewFilter)
-  , bqPet       :: !(Maybe PetFilter)
+  , bqSubjects  :: ![SubjectFilter]
   , bqCameras   :: !(Maybe [Text])
-  , bqSpecies   :: !(Maybe Text)
-  , bqActivity  :: !(Maybe Text)
+  , bqActivity  :: !(Maybe Activity)
+  , bqBehaviour :: !(Maybe Behaviour)
+  , bqWellbeing :: !(Maybe Wellbeing)
   , bqSearch    :: !(Maybe Text)
   , bqMedia     :: !(Maybe MediaKind)
   , bqTimeOfDay :: !(Maybe (TimeBucket, Int))
@@ -115,10 +173,11 @@ emptyBrowseQuery =
     { bqFrom = Nothing
     , bqTo = Nothing
     , bqReview = Nothing
-    , bqPet = Nothing
+    , bqSubjects = []
     , bqCameras = Nothing
-    , bqSpecies = Nothing
     , bqActivity = Nothing
+    , bqBehaviour = Nothing
+    , bqWellbeing = Nothing
     , bqSearch = Nothing
     , bqMedia = Nothing
     , bqTimeOfDay = Nothing
@@ -155,7 +214,7 @@ decodeCursor t = case T.splitOn ":" t of
 -- The facet total is computed only on the first, cursorless page.
 browseMoments :: Handle -> BrowseQuery -> IO BrowsePage
 browseMoments h bq = withConn h $ \c -> do
-  let base = baseFacets bq
+  let base = Just (readableRow, []) : baseFacets bq
       (whereBase, bindsBase) = assembleWhere base
       (whereFull, bindsFull) = assembleWhere (base ++ [cursorFacet (bqSort bq) (bqCursor bq)])
       dir = case bqSort bq of Asc -> "ASC"; Desc -> "DESC"
@@ -195,6 +254,21 @@ browseMoments h bq = withConn h $ \c -> do
       pure (Just (maybe 0 fromOnly (listToMaybe cnt)))
   pure (BrowsePage items nextC total)
 
+-- | The rows 'PetReport.Effect.Db.Queries.rowToObs' can actually decode, as a predicate both
+-- the page and the count carry.
+--
+-- The page partitions undecodable rows out and traces them; the count did not know about
+-- them, so a corrupt row left the header saying "20 moments" above a list of 19, with
+-- nothing on screen to explain the difference and no page that would ever produce the
+-- twentieth. Structural corruption is what the decoder rejects, and it is expressible here;
+-- a blob that parses as SQL JSON but not as a 'Perception' still slips past, and is still
+-- traced.
+readableRow :: Text
+readableRow =
+  "(o.source = 'sample' \
+  \ OR (o.source = 'event' AND o.event_id IS NOT NULL AND o.label IS NOT NULL AND o.score IS NOT NULL)) \
+  \AND json_valid(o.perception)"
+
 -- | The o.-qualified projection, in the exact column order 'rowToObs' decodes.
 selectCols :: Text
 selectCols =
@@ -215,23 +289,48 @@ baseFacets bq =
   , bqReview bq <&> \case
       Reviewed -> ("o.reviewed = 1", [])
       Unreviewed -> ("o.reviewed = 0", [])
-      NeedsLook -> ("o.uncertain = 1 AND o.reviewed = 0", [])
+      NeedsLook -> ("o.needs_look = 1 AND o.reviewed = 0", [])
   , bqCameras bq <&> \cams -> case cams of
       [] -> ("0 = 1", [])
       _ -> ("o.camera IN " <> placeholders (length cams), map toField cams)
-  , bqSpecies bq <&> \sp ->
-      ( "EXISTS (SELECT 1 FROM observation_subjects s WHERE s.obs_id = o.id AND s.species = ?)"
-      , [toField sp]
-      )
   , bqActivity bq <&> \act ->
       ( "EXISTS (SELECT 1 FROM observation_subjects s WHERE s.obs_id = o.id AND s.activity = ?)"
-      , [toField act]
+      , [toField (activityText act)]
       )
+  -- The column name comes from 'behaviourColumn' over a closed enum, never from the
+  -- request, so this stays as free of interpolated caller input as every other fragment.
+  , bqBehaviour bq <&> \b ->
+      ( "EXISTS (SELECT 1 FROM observation_subjects s \
+        \WHERE s.obs_id = o.id AND s." <> behaviourColumn b <> " = 1)"
+      , []
+      )
+  -- Scene wellbeing lives in the perception blob and has no column of its own. Reading it
+  -- with json_extract is what migration 2 already does to backfill needs_look, and it is
+  -- what lets the Today "N to check" badge open exactly the moments it counted rather than
+  -- the wider needs-a-look backlog. Unindexed, which is fine at household scale.
+  , bqWellbeing bq <&> \wb ->
+      let sceneArm = ("json_extract(o.perception, '$.scene.wellbeing') = ?", [toField (wellbeingText wb)])
+       in case wb of
+            -- A safety sound has no scene, so json_extract reads NULL and the arm above can
+            -- never match it, yet 'PetReport.Domain.Stats.wellbeingOf' calls it concerning
+            -- and the card shows it as such. The Today "N to check" badge counted those and
+            -- then opened a shorter list. Both readers now select the same sounds, off the
+            -- one label list they share.
+            Concerning ->
+              ( "(" <> fst sceneArm <> " OR json_extract(o.perception, '$.sound') IN " <> placeholders (length safetySoundLabels) <> ")"
+              , snd sceneArm ++ map toField safetySoundLabels
+              )
+            -- Every other wellbeing is a scene's own word; a sound carries none at all, so
+            -- widening these would select sounds no card ever labels that way.
+            _ -> sceneArm
   -- Free-text search: an approximate match over the moment's description, subjects,
   -- species, activity and sound text, all of which live in the perception blob. Room has
   -- its own facet. Crude, but it holds up at household scale.
   , bqSearch bq <&> \q ->
-      ("o.perception LIKE ?", [toField ("%" <> q <> "%")])
+      -- ESCAPE, because LIKE reads % and _ as wildcards and the box takes whatever the owner
+      -- types. Without it "100%" matched every moment and "_" matched all of them too, which
+      -- reads as a broken search rather than as a syntax nobody was told about.
+      ("o.perception LIKE ? ESCAPE '\\'", [toField ("%" <> escapeLike q <> "%")])
   , bqMedia bq <&> \case
       -- Mirrors 'PetReport.Domain.View.mediaFor', which dispatches on the perception: a
       -- 'Heard' sound is audio, a 'Seen' scene is photo or clip. So the facet keys off the
@@ -257,19 +356,50 @@ baseFacets bq =
        in if a <= b
             then (e <> " >= ? AND " <> e <> " < ?", [toField off, toField a, toField off, toField b])
             else ("(" <> e <> " >= ? OR " <> e <> " < ?)", [toField off, toField a, toField off, toField b])
-  , bqPet bq <&> \pf -> case pfUniqueSpecies pf of
-      Just sp ->
-        ( "EXISTS (SELECT 1 FROM observation_subjects s \
-          \LEFT JOIN subject_identity si ON si.obs_id = s.obs_id AND si.seq = s.seq AND si.confirmed = 1 \
-          \WHERE s.obs_id = o.id AND s.is_person = 0 \
-          \AND (si.pet_id = ? OR (si.pet_id IS NULL AND COALESCE(si.visiting, 0) = 0 AND s.species = ?)))"
-        , [toField (pfPetId pf), toField sp]
-        )
-      Nothing ->
-        ( "EXISTS (SELECT 1 FROM subject_identity si WHERE si.obs_id = o.id AND si.confirmed = 1 AND si.pet_id = ?)"
-        , [toField (pfPetId pf)]
-        )
   ]
+    -- One fragment per subject asked for, AND-ed with the rest by 'assembleWhere'. A
+    -- moment must satisfy EVERY subject named, so "Mochi and a person" returns the frames
+    -- that hold both rather than either.
+    ++ map (Just . subjectFacet) (bqSubjects bq)
+
+-- | Neutralise the LIKE wildcards in owner-typed search text, so it matches literally.
+-- The escape character itself goes first, or escaping the others would double-escape it.
+escapeLike :: Text -> Text
+escapeLike = T.replace "%" "\\%" . T.replace "_" "\\_" . T.replace "\\" "\\\\"
+
+-- | The EXISTS fragment for one subject filter.
+subjectFacet :: SubjectFilter -> (Text, [SQLData])
+subjectFacet = \case
+  SubjPet pf -> case pfUniqueSpecies pf of
+    Just sp ->
+      ( "EXISTS (SELECT 1 FROM observation_subjects s \
+        \LEFT JOIN subject_identity si ON si.obs_id = s.obs_id AND si.seq = s.seq AND si.confirmed = 1 \
+        \WHERE s.obs_id = o.id AND s.is_person = 0 \
+        \AND (si.pet_id = ? OR (si.pet_id IS NULL AND COALESCE(si.visiting, 0) = 0 AND s.species = ?)))"
+      , [toField (pfPetId pf), toField sp]
+      )
+    Nothing ->
+      ( "EXISTS (SELECT 1 FROM subject_identity si WHERE si.obs_id = o.id AND si.confirmed = 1 AND si.pet_id = ?)"
+      , [toField (pfPetId pf)]
+      )
+  SubjSpecies sp ->
+    ( "EXISTS (SELECT 1 FROM observation_subjects s WHERE s.obs_id = o.id AND s.species = ?)"
+    , [toField sp]
+    )
+  -- The facet the tree was missing. @is_person@ has been stored on every projected
+  -- sighting since the initial schema and was only ever read as an exclusion
+  -- (@is_person = 0@) inside the pet facet, so "show me when someone was home" had no
+  -- way to be asked. No new index: the subquery is keyed by obs_id, which is the
+  -- leading column of the observation_subjects primary key.
+  SubjPerson ->
+    ("EXISTS (SELECT 1 FROM observation_subjects s WHERE s.obs_id = o.id AND s.is_person = 1)", [])
+  -- An animal the owner marked as not theirs. Reads the override table directly, since
+  -- visiting-ness is an owner assertion and never a model output.
+  SubjVisiting ->
+    ( "EXISTS (SELECT 1 FROM subject_identity si \
+      \WHERE si.obs_id = o.id AND si.confirmed = 1 AND si.visiting = 1)"
+    , []
+    )
 
 -- | The keyset predicate for the cursor, matching the sort direction.
 cursorFacet :: SortDir -> Maybe Cursor -> Maybe (Text, [SQLData])

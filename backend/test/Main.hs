@@ -16,11 +16,12 @@ import           Data.Either              (isLeft)
 import           Data.List                (sort)
 import qualified Data.Map.Strict          as Map
 import           Data.Maybe               (isJust, listToMaybe, mapMaybe)
-import           Data.Text                (Text, isInfixOf, pack)
+import           Data.Text                (Text, isInfixOf, pack, unpack)
 import           Data.Time                (Day, UTCTime (..), addDays,
                                            addUTCTime, fromGregorian)
 import           Data.Time.Clock.POSIX    (utcTimeToPOSIXSeconds)
 import           Data.Time.Zones          (utcTZ)
+import qualified Database.SQLite.Simple   as SQL
 import           Hedgehog                 (Gen, Property, assert, evalIO,
                                            failure, forAll, property,
                                            tripping, (===))
@@ -28,8 +29,9 @@ import qualified Hedgehog.Gen             as Gen
 import qualified Hedgehog.Range           as Range
 import           Test.Tasty               (TestTree, defaultMain, testGroup)
 import           Test.Tasty.Hedgehog      (testProperty)
-import           Test.Tasty.HUnit         (assertBool, assertFailure, testCase,
-                                           (@?=))
+import           Test.Tasty.HUnit         (Assertion, assertBool, assertFailure,
+                                           testCase, (@?=))
+import           Servant                  (parseQueryParam)
 
 import           System.FilePath ((</>))
 import           System.IO.Temp  (withSystemTempDirectory)
@@ -59,9 +61,11 @@ import           PetReport.Domain.Profile
 import           PetReport.Domain.Stats
 import           PetReport.Domain.Types
 import           PetReport.Domain.View          (Chip (..), ObsMedia (..),
-                                                 ObsView (..), chipsOf,
-                                                 fallbackDescription, mediaFor,
-                                                 momentExpiry, viewOf)
+                                                 ObsView (..), SubjectRef (..),
+                                                 chipsOf, fallbackDescription,
+                                                 mediaFor, momentExpiry,
+                                                 subjectLabelOf, subjectRefOf,
+                                                 viewOf)
 import           PetReport.View.Enrich          (mkKeepsake, mkRecap,
                                                  wellbeingLine)
 import           PetReport.Domain.Window
@@ -75,6 +79,15 @@ import           PetReport.Web             (AskResp (AskResp), CameraInfo (Camer
                                             DayResponse (DayResponse),
                                             PresenceV (PresenceV), resolveRefresh)
 import qualified PetReport.Pipeline.Worker as Worker
+import           PetReport.Web.Facets      (ActivitySel (..), BehaviourSel (..),
+                                            MediaSel (..), ReviewSel (..),
+                                            SortSel (..), SubjectSel (..),
+                                            TimeOfDaySel (..), WellbeingSel (..),
+                                            activityValues, behaviourValues,
+                                            mediaValues, reviewValues, sortValues,
+                                            subjectSelValues, timeOfDayValues,
+                                            wellbeingValues)
+import           PetReport.Web.Types       (correctionKinds)
 
 main :: IO ()
 main = defaultMain tests
@@ -252,7 +265,7 @@ genAppearance = do
   w <- Gen.element [AnAnimal (Species "cat"), AnAnimal (Species "dog"), APerson]
   act <- Gen.enumBounded
   b <- genBehaviors
-  pure (Appearance w act b Nothing)
+  pure ((anAppearance w) {activity = act, behaviors = b})
   where
     genBehaviors = do
       a <- Gen.bool
@@ -307,15 +320,29 @@ genSceneEdit =
 genUTCTime :: Gen UTCTime
 genUTCTime = UTCTime <$> genDay <*> (fromIntegral <$> Gen.int (Range.linear 0 86399))
 
--- | Invariants of the perception transforms: normalisation is idempotent, and the
--- owner corrections/edits touch only what they are meant to (never a person appearance
--- or a Heard sound, and an individual attribution never rewrites the stored blob).
+-- | Invariants of the perception transforms: normalisation is idempotent, an individual
+-- attribution never rewrites the stored blob, and both corrections and edits touch exactly
+-- the sighting they address. That last one is the property the observation-scoped writer
+-- could not have satisfied: it wrote every animal in the moment at once, so naming the cat
+-- in a cat-and-dog frame relabelled the dog too.
 perceptionUnits :: [TestTree]
 perceptionUnits =
   [ testProperty "normalizeScene is idempotent" prop_normalizeIdempotent
-  , testProperty "an individual attribution (pet/visiting) leaves the perception blob unchanged" prop_correctionIndividualKeepsBlob
-  , testProperty "a species correction keeps persons and never touches a sound" prop_correctionKeepsPersonsAndSounds
-  , testProperty "an edit leaves person appearances and sounds untouched" prop_editKeepsPersonsAndSounds
+  , testProperty "a visiting attribution leaves the perception blob unchanged" prop_visitingKeepsBlob
+  , testProperty "naming a pet settles that sighting's species and nothing else" prop_toPetSettlesSpecies
+  , testProperty "a correction changes the addressed sighting and no other" prop_correctionHitsOneSighting
+  , testProperty "an edit changes the addressed sighting and no other" prop_editHitsOneSighting
+  , testProperty "an out-of-range sighting index leaves the scene alone" prop_outOfRangeIsNoop
+  , testCase "naming one cat in a two-cat frame leaves the other cat alone" $ do
+      -- The reported bug, at the level of the pure transform. Two animals in one scene;
+      -- correcting sighting 1 to a dog must not touch sighting 0.
+      let aCat = (anAppearance (AnAnimal (Species "cat"))) {activity = Sitting}
+          two = emptyScene {appearances = [aCat, aCat]}
+      case applyCorrectionAt 1 (ToSpecies (Species "dog")) (Seen two) of
+        Seen sc' ->
+          map who (appearances sc')
+            @?= [AnAnimal (Species "cat"), AnAnimal (Species "dog")]
+        Heard _ -> assertFailure "expected a scene"
   ]
 
 -- normalizeScene only repairs activity/behaviour consistency per appearance; running it
@@ -325,36 +352,71 @@ prop_normalizeIdempotent = property $ do
   sc <- forAll genScene
   normalizeScene (normalizeScene sc) === normalizeScene sc
 
--- ToPet/ToVisiting are per-individual attributions stored as overrides at the DB layer;
--- they must never rewrite the model-facing perception blob.
-prop_correctionIndividualKeepsBlob :: Property
-prop_correctionIndividualKeepsBlob = property $ do
+-- Marking a sighting as not-the-owner's is purely an attribution: it says nothing about
+-- what the camera saw, so the model-facing blob is untouched and the override carries it.
+prop_visitingKeepsBlob :: Property
+prop_visitingKeepsBlob = property $ do
   p <- forAll genPerception
-  applyCorrection ToVisiting p === p
-  applyCorrection (ToPet (PetId "dexter")) p === p
+  i <- forAll (Gen.int (Range.linear 0 4))
+  applyCorrectionAt i ToVisiting p === p
 
--- A species correction retargets only ANIMAL appearances (each stays an animal), leaves
--- every person a person, and never touches a Heard sound.
-prop_correctionKeepsPersonsAndSounds :: Property
-prop_correctionKeepsPersonsAndSounds = property $ do
+-- Naming an individual DOES say what kind of thing was seen: "that is Mochi" settles that
+-- the sighting is a cat. So it rewrites that sighting's species, and only that sighting's.
+-- Leaving the species alone is what used to let the projection say "dog" for a sighting the
+-- owner had called a cat.
+prop_toPetSettlesSpecies :: Property
+prop_toPetSettlesSpecies = property $ do
+  sc <- forAll genScene
+  i <- forAll (Gen.int (Range.linear 0 (max 0 (length (appearances sc) - 1))))
+  case applyCorrectionAt i (ToPet (PetId "dexter") (Species "cat")) (Seen sc) of
+    Seen sc' -> do
+      untouched i (appearances sc) === untouched i (appearances sc')
+      case drop i (appearances sc') of
+        (ap : _) | i < length (appearances sc) -> who ap === AnAnimal (Species "cat")
+        _                                      -> pure ()
+    Heard _ -> failure
+
+-- A correction rewrites the subject of exactly the addressed sighting. Every other
+-- appearance, and every Heard sound, comes back byte-identical.
+prop_correctionHitsOneSighting :: Property
+prop_correctionHitsOneSighting = property $ do
   sc <- forAll genScene
   k <- forAll (Gen.element ["bark", "meow"])
-  applyCorrection (ToSpecies (Species "dog")) (Heard (SoundKind k)) === Heard (SoundKind k)
-  case applyCorrection (ToSpecies (Species "dog")) (Seen sc) of
-    Seen sc' -> map (isPerson . who) (appearances sc') === map (isPerson . who) (appearances sc)
-    Heard _  -> failure
+  corr <- forAll (Gen.element [ToSpecies (Species "dog"), ToPerson])
+  applyCorrectionAt 0 corr (Heard (SoundKind k)) === Heard (SoundKind k)
+  i <- forAll (Gen.int (Range.linear 0 (max 0 (length (appearances sc) - 1))))
+  case applyCorrectionAt i corr (Seen sc) of
+    Seen sc' -> do
+      length (appearances sc') === length (appearances sc)
+      untouched i (appearances sc) === untouched i (appearances sc')
+    Heard _ -> failure
 
--- An owner edit applies to animal appearances and scene-level fields only: a person
--- appearance is passed through untouched, and a Heard sound is never edited.
-prop_editKeepsPersonsAndSounds :: Property
-prop_editKeepsPersonsAndSounds = property $ do
+-- The same for edits: scene-level fields may move, but only the addressed appearance does.
+prop_editHitsOneSighting :: Property
+prop_editHitsOneSighting = property $ do
   sc <- forAll genScene
   e <- forAll genSceneEdit
   k <- forAll (Gen.element ["bark", "meow"])
-  applyEdit e (Heard (SoundKind k)) === Heard (SoundKind k)
-  case applyEdit e (Seen sc) of
-    Seen sc' -> [a | a <- appearances sc', isPerson (who a)] === [a | a <- appearances sc, isPerson (who a)]
+  applyEditAt 0 e (Heard (SoundKind k)) === Heard (SoundKind k)
+  i <- forAll (Gen.int (Range.linear 0 (max 0 (length (appearances sc) - 1))))
+  case applyEditAt i e (Seen sc) of
+    Seen sc' -> untouched i (appearances sc) === untouched i (appearances sc')
     Heard _  -> failure
+
+-- Addressing a sighting the scene does not hold leaves every appearance alone. The write
+-- paths reject it before this point; the transform stays total regardless.
+prop_outOfRangeIsNoop :: Property
+prop_outOfRangeIsNoop = property $ do
+  sc <- forAll genScene
+  corr <- forAll (Gen.element [ToSpecies (Species "dog"), ToPerson])
+  let n = length (appearances sc)
+  case applyCorrectionAt n corr (Seen sc) of
+    Seen sc' -> appearances sc' === appearances sc
+    Heard _  -> failure
+
+-- Every appearance except the one at @i@, so a property can say "these did not move".
+untouched :: Int -> [Appearance] -> [Appearance]
+untouched i aps = [a | (j, a) <- zip [0 ..] aps, j /= i]
 
 -- | 'nextBatchTime' returns the earliest configured hour strictly after now, or Nothing
 -- exactly when no hours are configured; it never lands at or before now.
@@ -461,7 +523,7 @@ domainUnits =
       winFrom (parseWindow utcTZ now (Just "99999999999999999999d") Nothing)
         @?= startOfLocalDay utcTZ (fromGregorian 2026 7 8)
   , testCase "identify resolves against the roster" $ do
-      identify roster apCat @?= KnownPet dexter
+      identify roster apCat @?= KnownPet dexter Confirmed
       identify roster apBird @?= UnknownAnimal (Species "bird")
       identify roster apPerson @?= Human
   , testCase "eating implies ate, not drank" $ do
@@ -477,46 +539,160 @@ domainUnits =
   , testCase "presence attributes behaviours to the right pet" $ do
       let sc = emptyScene {appearances = [eatingCat]}
           obs = Observation (ObsId 1) t0 (Camera "office") PeriodicSample (Seen sc) False
-          m = presence mempty roster [obs]
+          m = resolvedStatsMap $ presence mempty roster [obs]
       fmap psAte (Map.lookup (KPet (PetId "dexter")) m) @?= Just 1
       fmap psSightings (Map.lookup (KPet (PetId "dexter")) m) @?= Just 1
   , testCase "an override attributes a same-species sighting to a specific pet" $ do
       let miso = Pet (PetId "miso") "Miso" (Species "cat") "grey cat" Nothing Nothing Nothing
           mochi = Pet (PetId "mochi") "Mochi" (Species "cat") "black cat" Nothing Nothing Nothing
           twoCat = [miso, mochi]
-          catAp = Appearance (AnAnimal (Species "cat")) Sleeping noBehaviors Nothing
-          ov = Map.fromList [((7, 0), IdPet (PetId "mochi"))]
+          catAp = (anAppearance (AnAnimal (Species "cat"))) {activity = Sleeping}
+          ov = Map.fromList [((7, 0), Attribution (IdPet (PetId "mochi")) Confirmed)]
       -- Two cats are ambiguous without an override, so neither is named.
       identify twoCat catAp @?= UnknownAnimal (Species "cat")
       -- The override resolves this exact sighting to the specific cat.
-      identifyWith ov twoCat (7, 0) catAp @?= KnownPet mochi
+      identifyWith ov twoCat (7, 0) catAp @?= KnownPet mochi Confirmed
       -- A different observation is unaffected.
       identifyWith ov twoCat (8, 0) catAp @?= UnknownAnimal (Species "cat")
+  , testCase "search text is matched literally, wildcards and all" $ do
+      -- LIKE reads % and _ as wildcards and the search box takes whatever is typed, so
+      -- "100%" used to return every moment and "_" every moment too.
+      Db.escapeLike "100%" @?= "100\\%"
+      Db.escapeLike "a_b" @?= "a\\_b"
+      Db.escapeLike "back\\slash" @?= "back\\\\slash"
+      -- Ordinary text is untouched, which is the case that matters every other time.
+      Db.escapeLike "Dexter at the bowl" @?= "Dexter at the bowl"
+  , testCase "a repeated subject is counted in the label, not collapsed away" $ do
+      -- A plain nub hid the state an owner needs in order to fix it: four subjects could
+      -- read exactly like two, while the day's per-pet totals counted all four.
+      let person n = SubjectRef n Nothing "A person" Nothing True False
+          pet n = SubjectRef n (Just "yuki") "Yuki" (Just "dog") False False
+      subjectLabelOf [pet 0, person 1] @?= "Yuki + A person"
+      subjectLabelOf [pet 0, person 1, person 2] @?= "Yuki + 2 people"
+      subjectLabelOf [person 0, person 1, person 2] @?= "3 people"
+      subjectLabelOf [pet 0, pet 1] @?= "Yuki x2"
+      subjectLabelOf [] @?= "Unclear"
+  , testCase "a name in the species slot moves to the field that means it" $ do
+      -- The name is what tells two dogs apart, so the repair keeps it rather than dropping
+      -- it: species into 'who', individual into 'pet'.
+      let named = (anAppearance (AnAnimal (Species "Yuki"))) {activity = Resting}
+          fixed = resolvePetNames [yuki] (emptyScene {appearances = [named]})
+      map who (appearances fixed) @?= [AnAnimal (Species "dog")]
+      map pet (appearances fixed) @?= [Just "Yuki"]
+      -- And the repaired reading resolves to the pet, as a correctly reported one does.
+      map (identify [yuki]) (appearances fixed) @?= [KnownPet yuki Confirmed]
+  , testCase "a name that disagrees with its own species is dropped" $ do
+      -- A model calling one subject a cat AND Yuki the dog has identified nothing, and
+      -- taking either half would be inventing the answer.
+      let clash = (anAppearance (AnAnimal (Species "cat"))) {pet = Just "Yuki"}
+          agrees = (anAppearance (AnAnimal (Species "dog"))) {pet = Just "Yuki"}
+          person = (anAppearance APerson) {pet = Just "Yuki"}
+          fixed = resolvePetNames [yuki, dexter] (emptyScene {appearances = [clash, agrees, person]})
+      map pet (appearances fixed) @?= [Nothing, Just "Yuki", Nothing]
+      -- The species each arrived with is left exactly as it was.
+      map who (appearances fixed)
+        @?= [AnAnimal (Species "cat"), AnAnimal (Species "dog"), APerson]
+  , testCase "a person is never given a pet's identity, whatever the model attached" $ do
+      -- The owner's write path refuses this outright and the stats projection drops it, but
+      -- identifyWith would believe it, so a person's card would have carried a pet's name.
+      let human = (anAppearance APerson) {pet = Just "Yuki"}
+      namedPet [yuki] human @?= Nothing
+      map pet (appearances (resolvePetNames [yuki] (emptyScene {appearances = [human]})))
+        @?= [Nothing]
+      -- And the same question answered for the cases that do hold up, or do not.
+      namedPet [yuki] ((anAppearance (AnAnimal (Species "dog"))) {pet = Just "Yuki"})
+        @?= Just yuki
+      namedPet [yuki] ((anAppearance (AnAnimal (Species "cat"))) {pet = Just "Yuki"})
+        @?= Nothing
+      namedPet [yuki] (anAppearance (AnAnimal (Species "dog"))) @?= Nothing
+  , testCase "a name no pet answers to is dropped" $ do
+      let stranger = (anAppearance (AnAnimal (Species "dog"))) {pet = Just "Bandit"}
+      map pet (appearances (resolvePetNames [yuki] (emptyScene {appearances = [stranger]})))
+        @?= [Nothing]
+  , testCase "an owner attribution outranks the model's, and both name the pet" $ do
+      -- Two dogs, so the roster cannot settle this on its own and the model's naming is a
+      -- real claim rather than agreement with the only answer.
+      let rex = Pet (PetId "rex") "Rex" (Species "dog") "large and black" Nothing Nothing Nothing
+          twoDogs = [yuki, rex]
+          ap' = anAppearance (AnAnimal (Species "dog"))
+          byModel = Map.fromList [((1, 0), Attribution (IdPet (PetId "yuki")) ByModel)]
+          byOwner = Map.fromList [((1, 0), Attribution (IdPet (PetId "yuki")) Confirmed)]
+      identifyWith byModel twoDogs (1, 0) ap' @?= KnownPet yuki ByModel
+      identifyWith byOwner twoDogs (1, 0) ap' @?= KnownPet yuki Confirmed
+      -- Both total for the same pet: a sighting the app will attribute is one it will count.
+      keyOf (identifyWith byModel twoDogs (1, 0) ap') @?= KPet (PetId "yuki")
+      keyOf (identifyWith byOwner twoDogs (1, 0) ap') @?= KPet (PetId "yuki")
+  , testCase "the model agreeing with the only possible pet is not a guess" $ do
+      -- One dog on the roster, so 'identify' would have reached Yuki with no attribution at
+      -- all. Marking that unconfirmed would badge every card in a one-pet household.
+      let ap' = anAppearance (AnAnimal (Species "dog"))
+          byModel = Map.fromList [((1, 0), Attribution (IdPet (PetId "yuki")) ByModel)]
+      identifyWith byModel roster (1, 0) ap' @?= KnownPet yuki Confirmed
+  , testCase "an unattributed animal names the pets it could have been, up to a point" $ do
+      -- With several pets of a species the bare species says nothing about the choice being
+      -- made. Past three the line stops being readable and the species is all that is left.
+      let dogs n = [Pet (PetId (pack ("d" <> show i))) (pack ("Dog" <> show i)) (Species "dog") "a dog" Nothing Nothing Nothing | i <- [1 .. n :: Int]]
+          labelFor rs = srLabel (subjectRefOf rs 0 (UnknownAnimal (Species "dog")))
+      labelFor (dogs 1) @?= "Dog"
+      labelFor (dogs 2) @?= "Dog1 or Dog2"
+      labelFor (dogs 3) @?= "Dog1, Dog2 or Dog3"
+      labelFor (dogs 4) @?= "Dog"
+      -- An archived pet is not a candidate; it can no longer be in the room.
+      case dogs 3 of
+        (first : rest) -> labelFor (first {petArchivedAt = Just t0} : rest) @?= "Dog2 or Dog3"
+        []             -> assertFailure "dogs 3 is not empty"
+  , testCase "the name match ignores case and surrounding space, and leaves people alone" $ do
+      let aps =
+            [ (anAppearance (AnAnimal (Species " yuki "))) {activity = Resting}
+            , (anAppearance (AnAnimal (Species "YUKI"))) {activity = Resting}
+            , (anAppearance APerson) {activity = Standing}
+            , (anAppearance (AnAnimal (Species "rabbit"))) {activity = Walking}
+            ]
+          fixed = resolvePetNames [yuki] (emptyScene {appearances = aps})
+      map who (appearances fixed)
+        @?= [ AnAnimal (Species "dog")
+            , AnAnimal (Species "dog")
+            , APerson
+            , AnAnimal (Species "rabbit")
+            ]
+  , testCase "a roster species wins over a pet named after some other species" $ do
+      -- A cat called Dog must not turn every genuine dog sighting into a cat.
+      let dogTheCat = Pet (PetId "dog-the-cat") "Dog" (Species "cat") "a cat called Dog" Nothing Nothing Nothing
+          rex = Pet (PetId "rex") "Rex" (Species "dog") "a dog called Rex" Nothing Nothing Nothing
+          sc = emptyScene {appearances = [(anAppearance (AnAnimal (Species "dog"))) {activity = Walking}]}
+      map who (appearances (resolvePetNames [dogTheCat, rex] sc)) @?= [AnAnimal (Species "dog")]
+  , testCase "repairing a reading twice changes nothing the second time" $ do
+      let sc = emptyScene {appearances = [(anAppearance (AnAnimal (Species "Yuki"))) {activity = Resting}]}
+          once = resolvePetNames [yuki] sc
+      resolvePetNames [yuki] once @?= once
+  , testCase "an empty roster leaves every reading exactly as it came" $ do
+      let sc = emptyScene {appearances = [(anAppearance (AnAnimal (Species "Yuki"))) {activity = Resting}]}
+      resolvePetNames [] sc @?= sc
   , testCase "an archived pet is excluded from auto-identification, but its corrections still resolve" $ do
       let active = Pet (PetId "dexter") "Dexter" (Species "cat") "orange cat" Nothing Nothing Nothing
           gone = Pet (PetId "misty") "Misty" (Species "cat") "grey cat" Nothing (Just t0) Nothing
           roster' = [active, gone]
-          catAp = Appearance (AnAnimal (Species "cat")) Sleeping noBehaviors Nothing
+          catAp = (anAppearance (AnAnimal (Species "cat"))) {activity = Sleeping}
       -- Two cats on paper, but one is archived, so the sole active cat is named.
-      identify roster' catAp @?= KnownPet active
+      identify roster' catAp @?= KnownPet active Confirmed
       -- An old correction to the archived pet still resolves to its name.
-      identifyWith (Map.fromList [((1, 0), IdPet (PetId "misty"))]) roster' (1, 0) catAp @?= KnownPet gone
+      identifyWith (Map.fromList [((1, 0), Attribution (IdPet (PetId "misty")) Confirmed)]) roster' (1, 0) catAp @?= KnownPet gone Confirmed
   , testCase "presence credits an override to the specific pet only" $ do
       let miso = Pet (PetId "miso") "Miso" (Species "cat") "grey cat" Nothing Nothing Nothing
           mochi = Pet (PetId "mochi") "Mochi" (Species "cat") "black cat" Nothing Nothing Nothing
           twoCat = [miso, mochi]
           sc = emptyScene {appearances = [eatingCat]}
           obs = Observation (ObsId 3) t0 (Camera "office") PeriodicSample (Seen sc) False
-          ov = Map.fromList [((3, 0), IdPet (PetId "mochi"))]
-          m = presence ov twoCat [obs]
+          ov = Map.fromList [((3, 0), Attribution (IdPet (PetId "mochi")) Confirmed)]
+          m = resolvedStatsMap $ presence ov twoCat [obs]
       fmap psAte (Map.lookup (KPet (PetId "mochi")) m) @?= Just 1
       Map.lookup (KPet (PetId "miso")) m @?= Nothing
       Map.lookup (KSpecies (Species "cat")) m @?= Nothing
   , testCase "a visitor override is excluded from the pet's stats" $ do
       let sc = emptyScene {appearances = [eatingCat]}
           obs = Observation (ObsId 9) t0 (Camera "office") PeriodicSample (Seen sc) False
-          ov = Map.fromList [((9, 0), IdVisiting)]
-          m = presence ov roster [obs]
+          ov = Map.fromList [((9, 0), Attribution IdVisiting Confirmed)]
+          m = resolvedStatsMap $ presence ov roster [obs]
       identifyWith ov roster (9, 0) eatingCat @?= Visiting (Species "cat")
       Map.lookup (KPet (PetId "dexter")) m @?= Nothing
       fmap psSightings (Map.lookup (KVisitor (Species "cat")) m) @?= Just 1
@@ -526,7 +702,7 @@ domainUnits =
       prSomeoneHome (homePresence [catObs]) @?= False
       prSomeoneHome (homePresence [personObs, catObs]) @?= True
       prPersonSightings (homePresence [personObs, catObs]) @?= 1
-  , testCase "applyEdit overwrites set fields and keeps the rest" $ do
+  , testCase "applyEditAt overwrites set fields and keeps the rest" $ do
       let sc = emptyScene {appearances = [apCat], description = Just "old"}
           e =
             noEdit
@@ -535,7 +711,7 @@ domainUnits =
               , seDescription = Just "new note"
               , seWellbeing = Just Concerning
               }
-      case applyEdit e (Seen sc) of
+      case applyEditAt 0 e (Seen sc) of
         Seen sc' -> do
           description sc' @?= Just "new note"
           wellbeing sc' @?= Concerning
@@ -543,9 +719,9 @@ domainUnits =
           fmap (ate . behaviors) (listToMaybe (appearances sc')) @?= Just True
           fmap (slept . behaviors) (listToMaybe (appearances sc')) @?= Just False
         Heard _ -> assertFailure "expected a scene"
-  , testCase "applyEdit clears an optional field on blank" $ do
+  , testCase "applyEditAt clears an optional field on blank" $ do
       let sc = emptyScene {appearances = [apCat], description = Just "old"}
-      case applyEdit noEdit {seDescription = Just "   "} (Seen sc) of
+      case applyEditAt 0 noEdit {seDescription = Just "   "} (Seen sc) of
         Seen sc' -> description sc' @?= Nothing
         Heard _  -> assertFailure "expected a scene"
   , testCase "boundedLines keeps recent lines and notes the drop" $ do
@@ -557,26 +733,22 @@ domainUnits =
       soundPhrase (SoundKind "whimper_dog") @?= "a whimper"
       isSafetySound (SoundKind "smoke_detector") @?= True
       isSafetySound (SoundKind "bark") @?= False
-  , testCase "applyEdit is idempotent" $ do
+  , testCase "applyEditAt is idempotent" $ do
       let sc = emptyScene {appearances = [apCat]}
           e = noEdit {seActivity = Just Playing, seAte = Just True}
-          once = applyEdit e (Seen sc)
-      applyEdit e once @?= once
+          once = applyEditAt 0 e (Seen sc)
+      applyEditAt 0 e once @?= once
   ]
   where
     dexter = Pet (PetId "dexter") "Dexter" (Species "cat") "orange cat" Nothing Nothing Nothing
     yuki = Pet (PetId "yuki") "Yuki" (Species "dog") "three-legged dog" (Just "3 legs") Nothing Nothing
     roster = [dexter, yuki]
     noEdit = SceneEdit Nothing Nothing Nothing Nothing Nothing Nothing Nothing Nothing Nothing
-    apCat = Appearance (AnAnimal (Species "cat")) Sleeping noBehaviors Nothing
-    apBird = Appearance (AnAnimal (Species "bird")) Alert noBehaviors Nothing
-    apPerson = Appearance APerson Standing noBehaviors Nothing
+    apCat = (anAppearance (AnAnimal (Species "cat"))) {activity = Sleeping}
+    apBird = (anAppearance (AnAnimal (Species "bird"))) {activity = Alert}
+    apPerson = (anAppearance APerson) {activity = Standing}
     eatingCat =
-      Appearance
-        (AnAnimal (Species "cat"))
-        Eating
-        (normalizeBehaviors Eating noBehaviors)
-        Nothing
+      (anAppearance (AnAnimal (Species "cat"))) {activity = Eating, behaviors = (normalizeBehaviors Eating noBehaviors)}
     elim t p = noBehaviors {eliminated = Just (Elimination t p)}
     t0 = UTCTime (fromGregorian 2026 7 8) 0
     assertLE a b =
@@ -593,10 +765,13 @@ viewUnits =
   , testCase "low confidence marks a card uncertain" $ do
       let v = mkView (emptyScene {appearances = [eatingCat], confidence = Just (mkConfidence 0.4)})
       ovUncertain v @?= True
-  , testCase "chipsOf flags visitor and notable" $ do
+  , testCase "chipsOf flags a person distinctly from a not-my-pet animal" $ do
+      -- The two used to share one "visitor" chip, so a card could not say whether a human
+      -- or a neighbour's cat had been through. They are separate pills now.
       let sc = emptyScene {appearances = [eatingCat, personAp], notable = Just "doorbell"}
           ls = map chLabel (chipsOf sc)
-      elem "visitor" ls @?= True
+      elem "person" ls @?= True
+      elem "not my pet" ls @?= False
       elem "notable" ls @?= True
   , testCase "hourHistogram buckets by local hour" $ do
       let obsH = Observation (ObsId 2) tHour (Camera "office") PeriodicSample (Seen sc1) False
@@ -604,7 +779,10 @@ viewUnits =
       length hh @?= 24
       (hh !! 14) @?= 1
   , testCase "roomDistribution counts per room" $
-      roomDistribution [] mempty roster (PetId "dexter") [obs1, obs1] @?= [("Office", 2)]
+      -- The label falls back to a title-cased camera id, and the camera it came from is
+      -- carried alongside so a link can filter on something that actually exists.
+      roomDistribution [] mempty roster (PetId "dexter") [obs1, obs1]
+        @?= [("Office", ["office"], 2)]
   , testCase "petStatOver is monotone over nested windows (day <= week <= month)" $ do
       -- One sighting today, one 2 days ago, one 9 days ago: the 1/7/30-day windows
       -- must count 1/2/3, so day <= week <= month holds by construction.
@@ -648,11 +826,24 @@ viewUnits =
       ovWellbeing v @?= "concerning"
       ovDescription v @?= Just "Heard a smoke alarm"
       elem "safety" (map chLabel (ovChips v)) @?= True
+      -- A sound is never uncertain: it carries neither wellbeing nor confidence to be unsure
+      -- about. It still earns a review, because concerning is a separate reason to look.
+      -- Keeping these two apart is what lets the "N to check" badge lead somewhere.
+      ovUncertain v @?= False
+      ovNeedsReview v @?= True
+  , testCase "a reviewed concerning moment leaves the backlog" $ do
+      ovNeedsReview (mkHeard (SoundKind "glass") False) @?= True
+      ovNeedsReview (mkHeard (SoundKind "glass") True) @?= False
+  , testCase "a confidently concerning scene needs review though it is not uncertain" $ do
+      let v = mkView emptyScene {appearances = [eatingCat], wellbeing = Concerning, confidence = Just (mkConfidence 0.95)}
+      ovUncertain v @?= False
+      ovWellbeing v @?= "concerning"
+      ovNeedsReview v @?= True
   , testCase "wellbeingLine hides a thin week, shows the shape of a full one" $ do
       -- Under 5 sightings this week is too thin to say anything.
-      wellbeingLine "Dexter" Settled 4 30 (Just "Office") @?= Nothing
+      wellbeingLine "Dexter" 4 30 (Just "Office") @?= Nothing
       -- At/over the threshold the line carries the name, count and rest pct.
-      case wellbeingLine "Dexter" Settled 5 30 (Just "Office") of
+      case wellbeingLine "Dexter" 5 30 (Just "Office") of
         Nothing -> assertFailure "expected a wellbeing line at 5 sightings"
         Just l -> do
           ("Dexter" `isInfixOf` l) @?= True
@@ -660,13 +851,15 @@ viewUnits =
           ("30%" `isInfixOf` l) @?= True
           -- The favourite room is named when present.
           ("most often in the Office" `isInfixOf` l) @?= True
-          -- A "good" kind ends on a plain full stop, no flagged-moment sentence.
-          ("flagged for a look" `isInfixOf` l) @?= False
-  , testCase "wellbeingLine appends the flagged-moment sentence for a watch" $
-      case wellbeingLine "Miso" Flagged 8 20 Nothing of
+  , testCase "wellbeingLine never claims a moment is flagged" $
+      -- It used to append "One moment is flagged for a look" for any watch verdict, which
+      -- was false when the verdict came from a missed meal: there is no such moment, and it
+      -- pointed the owner at a review queue that could be empty. The reason now lives on the
+      -- note and glance chips, which name it.
+      case wellbeingLine "Miso" 8 20 Nothing of
         Nothing -> assertFailure "expected a wellbeing line at 8 sightings"
         Just l -> do
-          ("One moment is flagged for a look." `isInfixOf` l) @?= True
+          ("flagged for a look" `isInfixOf` l) @?= False
           -- No top spot, so no "most often in" clause.
           ("most often in" `isInfixOf` l) @?= False
   , testCase "mkRecap pins Seen/Days seen to the live week, passes the rest through" $ do
@@ -712,35 +905,34 @@ viewUnits =
       kpRoom kv @?= "Office"
       kpMedia kv @?= "photo"
       kpImg kv @?= Just ("/proof/office/" <> tsText t0 <> ".jpg")
-  , testCase "resolveCorrection follows visiting > person > pet > species precedence" $ do
-      -- Visiting wins over everything set at once.
-      resolveCorrection roster (target (Just "dexter") (Just "cat") (Just True) (Just True))
-        @?= Just ToVisiting
-      -- Person is next when visiting is unset.
-      resolveCorrection roster (target (Just "dexter") (Just "cat") (Just True) Nothing)
-        @?= Just ToPerson
-      -- A roster pet id is next; it must actually exist in the roster.
-      resolveCorrection roster (target (Just "dexter") (Just "cat") Nothing Nothing)
-        @?= Just (ToPet (PetId "dexter"))
-      -- Species last, when nothing higher is set.
-      resolveCorrection roster (target Nothing (Just "cat") Nothing Nothing)
-        @?= Just (ToSpecies (Species "cat"))
-      -- All unset resolves to nothing.
-      resolveCorrection roster (target Nothing Nothing Nothing Nothing) @?= Nothing
-      -- A pet id NOT in the roster falls through to the species rather than naming it.
-      resolveCorrection roster (target (Just "ghost") (Just "cat") Nothing Nothing)
-        @?= Just (ToSpecies (Species "cat"))
+  , testCase "resolveCorrection maps each target, and only an unknown pet id fails" $ do
+      -- One constructor in, one correction out. There is no precedence chain left to test
+      -- because the target sum cannot hold two answers at once, which is the point of it.
+      resolveCorrection roster TargetVisiting @?= Just ToVisiting
+      resolveCorrection roster TargetPerson @?= Just ToPerson
+      resolveCorrection roster (TargetPet "dexter") @?= Just (ToPet (PetId "dexter") (Species "cat"))
+      resolveCorrection roster (TargetSpecies "cat") @?= Just (ToSpecies (Species "cat"))
+      -- A pet id absent from the roster is rejected rather than quietly demoted to the
+      -- species. The old fall-through turned a typo into a correction nobody asked for.
+      resolveCorrection roster (TargetPet "ghost") @?= Nothing
   ]
   where
     dexter = Pet (PetId "dexter") "Dexter" (Species "cat") "orange cat" Nothing Nothing Nothing
     roster = [dexter]
     eatingCat =
-      Appearance (AnAnimal (Species "cat")) Eating (normalizeBehaviors Eating noBehaviors) Nothing
-    personAp = Appearance APerson Standing noBehaviors Nothing
+      (anAppearance (AnAnimal (Species "cat"))) {activity = Eating, behaviors = (normalizeBehaviors Eating noBehaviors)}
+    personAp = (anAppearance APerson) {activity = Standing}
     sc1 = emptyScene {appearances = [eatingCat]}
     obs1 = Observation (ObsId 1) t0 (Camera "office") PeriodicSample (Seen sc1) False
     tHour = UTCTime (fromGregorian 2026 7 8) 50400
     stubMedia = const (ObsMedia "photo" Nothing Nothing)
+    mkHeard sk rev =
+      viewOf
+        roster
+        mempty
+        (roomOf [])
+        stubMedia
+        (Observation (ObsId 1) t0 (Camera "office") PeriodicSample (Heard sk) rev)
     mkView sc =
       viewOf
         roster
@@ -759,7 +951,6 @@ viewUnits =
     seenEvent mev = Observation (ObsId 1) t0 (Camera "office") (maybe PeriodicSample FromEvent mev) (Seen sc1) False
     -- The POSIX-seconds stamp mediaFor embeds in a proof URL, as text.
     tsText tt = pack (show (round (utcTimeToPOSIXSeconds tt) :: Integer))
-    target = CorrectionTarget
 
 -- | The JSON contract the frontend mirrors: pin the exact top-level keys the
 -- backend emits for the complex response types, so a field rename/add/remove
@@ -799,7 +990,7 @@ contractUnits =
         @?= sort
           [ "pets", "report", "household", "cameras"
           , "frigateUrl", "modelUrl", "visionModel", "timeZone", "gcWindowDays"
-          , "configuredAt"
+          , "captureSecs", "configuredAt"
           ]
   , testCase "Pet JSON keys match the client contract" $
       jsonKeys (encode (Pet (PetId "p") "P" (Species "cat") "desc" Nothing Nothing Nothing))
@@ -830,7 +1021,7 @@ contractUnits =
   where
     dexter = Pet (PetId "dexter") "Dexter" (Species "cat") "orange cat" Nothing Nothing Nothing
     t0' = UTCTime (fromGregorian 2026 7 8) 0
-    catAp = Appearance (AnAnimal (Species "cat")) Eating (normalizeBehaviors Eating noBehaviors) Nothing
+    catAp = (anAppearance (AnAnimal (Species "cat"))) {activity = Eating, behaviors = (normalizeBehaviors Eating noBehaviors)}
     obs = Observation (ObsId 1) t0' (Camera "office") PeriodicSample (Seen emptyScene {appearances = [catAp]}) False
     ov = viewOf [dexter] mempty (roomOf []) (const (ObsMedia "photo" Nothing Nothing)) obs
     ins = insightsFor utcTZ mempty [] [dexter] t0' dexter [obs]
@@ -840,8 +1031,88 @@ contractUnits =
 -- the DB cache mirror: the exact string set each enum serialises to. A future
 -- rename of any constructor's encoding breaks a test HERE, at the backend, before
 -- it can silently diverge from the hand-written client or a stored column value.
+-- | The browse facet vocabularies: every legal value round-trips, and every illegal one
+-- is REJECTED with a message naming the field and the legal set.
+--
+-- The suite already pinned seven wire vocabularies this way and pinned none of the browse
+-- filters, which is the gap the "Someone was home" bug lived in. That link sent
+-- @pet=visitor@; the server accepted the string, built a filter for a pet id no roster
+-- holds, and answered 200 with an empty page. Nothing failed, so nothing was noticed.
+--
+-- The rejection half matters as much as the round-trip half: a facet that silently drops
+-- an unparseable value returns a result set that disagrees with the filter the caller
+-- asked for, and the caller cannot tell.
+browseFacetUnits :: [TestTree]
+browseFacetUnits =
+  [ testCase "subject vocabulary parses each form and rejects the rest" $ do
+      parseQueryParam "person" @?= Right SelPerson
+      parseQueryParam "visiting" @?= Right SelVisiting
+      parseQueryParam "pet:mochi" @?= Right (SelPet "mochi")
+      parseQueryParam "species:cat" @?= Right (SelSpecies "cat")
+      -- The exact string the old link carried. It must not parse as a pet id.
+      assertRejected "subject" (parseQueryParam @SubjectSel "visiting:")
+      -- The old spelling must not quietly keep working, or the two vocabularies drift.
+      assertRejected "subject" (parseQueryParam @SubjectSel "visitor")
+      assertRejected "subject" (parseQueryParam @SubjectSel "pet:")
+      assertRejected "subject" (parseQueryParam @SubjectSel "gibberish")
+      subjectSelValues @?= ["pet:<id>", "species:<name>", "person", "visiting"]
+  , testCase "activity vocabulary is exactly the Activity enum and round-trips" $ do
+      -- Derived from the enum on both sides, so a new constructor cannot appear in the
+      -- model's schema without also becoming filterable.
+      activityValues @?= map activityText [minBound .. maxBound]
+      let back = [either (const Nothing) (\(ActivitySel a) -> Just a) (parseQueryParam v) | v <- activityValues]
+      back @?= map Just [minBound .. maxBound :: Activity]
+      assertRejected "activity" (parseQueryParam @ActivitySel "napping")
+  , testCase "behaviour vocabulary covers every projected column and round-trips" $ do
+      behaviourValues
+        @?= ["ate", "drank", "slept", "played", "groomed", "eliminated", "rest", "active", "concern"]
+      let back = [either (const Nothing) (\(BehaviourSel b) -> Just b) (parseQueryParam v) | v <- behaviourValues]
+      back @?= map Just [minBound .. maxBound :: Db.Behaviour]
+      assertRejected "behaviour" (parseQueryParam @BehaviourSel "toilet")
+  , testCase "wellbeing vocabulary is exactly the Wellbeing enum" $ do
+      wellbeingValues @?= ["normal", "concerning", "unclear"]
+      let back = [either (const Nothing) (\(WellbeingSel w) -> Just w) (parseQueryParam v) | v <- wellbeingValues]
+      back @?= map Just [minBound .. maxBound :: Wellbeing]
+      assertRejected "wellbeing" (parseQueryParam @WellbeingSel "bad")
+  , testCase "review vocabulary is exactly {reviewed, unreviewed, needs-look}" $ do
+      reviewValues @?= ["reviewed", "unreviewed", "needs-look"]
+      let back = [either (const Nothing) (\(ReviewSel r) -> Just r) (parseQueryParam v) | v <- reviewValues]
+      back @?= map Just [Db.Reviewed, Db.Unreviewed, Db.NeedsLook]
+      assertRejected "review" (parseQueryParam @ReviewSel "needslook")
+  , testCase "media vocabulary is exactly {photo, clip, audio}" $ do
+      mediaValues @?= ["photo", "clip", "audio"]
+      assertRejected "media" (parseQueryParam @MediaSel "expired")
+  , testCase "timeOfDay vocabulary is exactly the four buckets, night wrapping midnight" $ do
+      timeOfDayValues @?= ["morning", "afternoon", "evening", "night"]
+      let bucket v = either (const Nothing) (\(TimeOfDaySel b) -> Just b) (parseQueryParam v)
+      bucket "morning" @?= Just (Db.TimeBucket (5 * 3600) (12 * 3600))
+      bucket "night" @?= Just (Db.TimeBucket (21 * 3600) (5 * 3600))
+      assertRejected "timeOfDay" (parseQueryParam @TimeOfDaySel "dawn")
+  , testCase "sort rejects an unknown direction rather than defaulting to desc" $ do
+      sortValues @?= ["asc", "desc"]
+      -- "desc" used to be everything-that-is-not-"asc", so a typo silently ordered
+      -- newest-first and looked deliberate.
+      assertRejected "sort" (parseQueryParam @SortSel "descending")
+  , testCase "correction kinds are exactly {pet, species, person, visitor}" $
+      -- "visiting" is an animal that is not the owner's; "person" is a human. They were
+      -- both spelled "visitor" somewhere, which is why a card could not say which it meant.
+      correctionKinds @?= ["pet", "species", "person", "visiting"]
+  ]
+
+-- | Assert a facet rejected its input, and that the message names the field so a client
+-- author reads the answer instead of guessing.
+assertRejected :: Text -> Either Text a -> Assertion
+assertRejected field r = case r of
+  Left msg ->
+    assertBool
+      ("rejection should name the field " <> unpack field <> ", got: " <> unpack msg)
+      (field `isInfixOf` msg)
+  Right _ -> assertFailure ("expected " <> unpack field <> " to reject this value")
+
 vocabularyUnits :: [TestTree]
 vocabularyUnits =
+  browseFacetUnits
+    ++
   [ testCase "WellbeingKind encodes to exactly {good, watch} and round-trips (tolerant default)" $ do
       -- The verdict vocabulary the pet_summaries column and PetInsights JSON speak.
       map wellbeingKindText [minBound .. maxBound] @?= ["good", "watch"]
@@ -882,7 +1153,7 @@ vocabularyUnits =
       -- branch and pin the full set, so a fifth kind (or a rename) fails here.
       let base = UTCTime (fromGregorian 2026 7 8) 0
           monthLater = addUTCTime (60 * 86400) base
-          catAp' = Appearance (AnAnimal (Species "cat")) Sleeping noBehaviors Nothing
+          catAp' = (anAppearance (AnAnimal (Species "cat"))) {activity = Sleeping}
           seenSc = emptyScene {appearances = [catAp']}
           clipEv = FrigateMeta (EventId "e1") "cat" 0.9 True True
           snapEv = FrigateMeta (EventId "e2") "cat" 0.9 False True
@@ -908,7 +1179,7 @@ vocabularyUnits =
   , testCase "momentExpiry: an event counts down to the EARLIER of GC and the clip; a sample doesn't" $ do
       let base = UTCTime (fromGregorian 2026 7 8) 0
           ret = Map.fromList [("office", 10)]
-          catAp' = Appearance (AnAnimal (Species "cat")) Sleeping noBehaviors Nothing
+          catAp' = (anAppearance (AnAnimal (Species "cat"))) {activity = Sleeping}
           seenSc = emptyScene {appearances = [catAp']}
           clipEv = FrigateMeta (EventId "e1") "cat" 0.9 True True
           ev = Observation (ObsId 1) base (Camera "office") (FromEvent clipEv) (Seen seenSc) False
@@ -925,7 +1196,7 @@ vocabularyUnits =
       -- The card wellbeing string is derived from the Wellbeing sum (Seen: its three
       -- cases via wellbeingText) plus the audio "none" path; pin the full set.
       let base = UTCTime (fromGregorian 2026 7 8) 0
-          catAp' = Appearance (AnAnimal (Species "cat")) Sleeping noBehaviors Nothing
+          catAp' = (anAppearance (AnAnimal (Species "cat"))) {activity = Sleeping}
           stubMedia = const (ObsMedia "photo" Nothing Nothing)
           seenWith w =
             viewOf
@@ -971,7 +1242,229 @@ jsonKeys bs = case decode bs of
 -- redesign; the SQL path is 'identifyWith' expressed relationally.
 dbUnits :: [TestTree]
 dbUnits =
-  [ testCase "SQL subjectStatsBetween agrees with blob presence, honouring overrides" $
+  [ testCase "the model's naming is stored, gated on its own confidence, and adopted on confirm" $
+      -- The whole point of the feature: with two dogs, species alone can never say which,
+      -- so the model's answer is what attributes the sighting.
+      withSystemTempDirectory "petreport-spec" $ \dir ->
+        Db.withHandle (dbTracer renderingTracer) (dir </> "spec.db") $ \h -> do
+          let base = UTCTime (fromGregorian 2026 7 8) 0
+              yuki' = Pet (PetId "yuki") "Yuki" (Species "dog") "three legs" Nothing Nothing Nothing
+              rex = Pet (PetId "rex") "Rex" (Species "dog") "large and black" Nothing Nothing Nothing
+              twoDogs = [yuki', rex]
+              dog nm = (anAppearance (AnAnimal (Species "dog"))) {pet = nm, activity = Resting}
+              sceneOf aps conf = emptyScene {appearances = aps, confidence = Just (mkConfidence conf)}
+              new' k sc = NewObservation (addUTCTime (fromInteger (k * 100)) base) (Camera "office") PeriodicSample (Seen sc)
+          -- One frame holding both dogs, named apart, and confident.
+          Db.insertObservation h twoDogs (new' 1 (sceneOf [dog (Just "Yuki"), dog (Just "Rex")] 0.95))
+          -- A naming the model was NOT sure of.
+          Db.insertObservation h twoDogs (new' 2 (sceneOf [dog (Just "Yuki")] 0.40))
+          -- Confident, but it could not say which.
+          Db.insertObservation h twoDogs (new' 3 (sceneOf [dog Nothing] 0.95))
+          ov1 <- Db.allAttributionsForObs h 1
+          Map.lookup (1, 0) ov1 @?= Just (Attribution (IdPet (PetId "yuki")) ByModel)
+          Map.lookup (1, 1) ov1 @?= Just (Attribution (IdPet (PetId "rex")) ByModel)
+          -- The confident frame counts for both dogs; the unsure one and the unnamed one
+          -- count for neither.
+          counted <- Db.countedAttributionsForObsIds h [1, 2, 3]
+          Map.keys counted @?= [(1, 0), (1, 1)]
+          -- The unsure guess is kept so the viewer can offer it, and stays a guess: the card
+          -- never showed the name, so a verdict on the moment cannot be a verdict on it.
+          ov2 <- Db.allAttributionsForObs h 2
+          Map.lookup (2, 0) ov2 @?= Just (Attribution (IdPet (PetId "yuki")) ByModel)
+          Db.markReviewed h [2]
+          ov2' <- Db.allAttributionsForObs h 2
+          Map.lookup (2, 0) ov2' @?= Just (Attribution (IdPet (PetId "yuki")) ByModel)
+          Db.countedAttributionsForObsIds h [2] >>= ((@?= []) . Map.keys)
+          -- Naming that sighting outright is what settles it.
+          Db.correctObservation h 2 0 (ToPet (PetId "yuki") (Species "dog")) >>= (@?= True)
+          ov2'' <- Db.allAttributionsForObs h 2
+          Map.lookup (2, 0) ov2'' @?= Just (Attribution (IdPet (PetId "yuki")) Confirmed)
+          Db.countedAttributionsForObsIds h [2] >>= ((@?= [(2, 0)]) . Map.keys)
+          -- A confident guess DOES settle on the moment's verdict, and un-settles with it,
+          -- because that name was on the card the owner agreed with.
+          Db.countedAttributionsForObsIds h [1] >>= (\m -> Map.lookup (1, 0) m @?= Just (Attribution (IdPet (PetId "yuki")) ByModel))
+          Db.markReviewed h [1]
+          Db.countedAttributionsForObsIds h [1] >>= (\m -> Map.lookup (1, 0) m @?= Just (Attribution (IdPet (PetId "yuki")) Confirmed))
+          Db.unreviewObservation h 1 >>= (@?= True)
+          Db.countedAttributionsForObsIds h [1] >>= (\m -> Map.lookup (1, 0) m @?= Just (Attribution (IdPet (PetId "yuki")) ByModel))
+          -- Nothing was invented for the frame the model could not name.
+          ov3 <- Db.allAttributionsForObs h 3
+          Map.keys ov3 @?= []
+  , testCase "an owner correction survives the backfill that would otherwise re-guess it" $
+      withSystemTempDirectory "petreport-spec" $ \dir ->
+        Db.withHandle (dbTracer renderingTracer) (dir </> "spec.db") $ \h -> do
+          let base = UTCTime (fromGregorian 2026 7 8) 0
+              yuki' = Pet (PetId "yuki") "Yuki" (Species "dog") "three legs" Nothing Nothing Nothing
+              rex = Pet (PetId "rex") "Rex" (Species "dog") "large and black" Nothing Nothing Nothing
+              twoDogs = [yuki', rex]
+              sc = emptyScene {appearances = [(anAppearance (AnAnimal (Species "dog"))) {pet = Just "Yuki"}], confidence = Just (mkConfidence 0.95)}
+          Db.insertObservation h twoDogs (NewObservation base (Camera "office") PeriodicSample (Seen sc))
+          -- The owner says it was actually Rex.
+          Db.correctObservation h 1 0 (ToPet (PetId "rex") (Species "dog")) >>= (@?= True)
+          -- The backfill runs over history the owner may long since have corrected.
+          _ <- Db.repairNamedSpecies h twoDogs
+          ov <- Db.allAttributionsForObs h 1
+          Map.lookup (1, 0) ov @?= Just (Attribution (IdPet (PetId "rex")) Confirmed)
+  , testCase "the repair folds stored pet-name readings onto the species, once" $
+      -- The half that cannot be fixed at the decode: readings already in the database,
+      -- invisible to the pet facet and splitting the day's per-pet totals in two.
+      withSystemTempDirectory "petreport-spec" $ \dir ->
+        Db.withHandle (dbTracer renderingTracer) (dir </> "spec.db") $ \h -> do
+          let base = UTCTime (fromGregorian 2026 7 8) 0
+              yuki = Pet (PetId "yuki") "Yuki" (Species "dog") "three-legged dog" Nothing Nothing Nothing
+              ap sp = (anAppearance (AnAnimal (Species sp))) {activity = Resting}
+              named = emptyScene {appearances = [ap "Yuki", (anAppearance APerson) {activity = Standing}]}
+              proper = emptyScene {appearances = [ap "dog"]}
+              whoOf o = case perception o of
+                Seen sc -> map who (appearances sc)
+                Heard _ -> []
+          Db.insertObservation h [] (NewObservation base (Camera "office") PeriodicSample (Seen named))
+          Db.insertObservation h [] (NewObservation base (Camera "hall") PeriodicSample (Seen proper))
+          Db.repairNamedSpecies h [yuki] >>= (@?= 1)
+          o1 <- Db.getObservation h 1
+          fmap whoOf o1 @?= Just [AnAnimal (Species "dog"), APerson]
+          -- A correctly reported reading is left alone, and a second pass finds nothing.
+          o2 <- Db.getObservation h 2
+          fmap whoOf o2 @?= Just [AnAnimal (Species "dog")]
+          Db.repairNamedSpecies h [yuki] >>= (@?= 0)
+          -- Undo restores from raw_perception, so the repair has to reach there too or the
+          -- phantom species comes straight back the first time an owner presses it.
+          Db.revertObservation h [] 1 >>= (@?= True)
+          o1' <- Db.getObservation h 1
+          fmap whoOf o1' @?= Just [AnAnimal (Species "dog"), APerson]
+  , testCase "a subject change leaves the verdict open; only a verdict settles the moment" $
+      -- The reported bug: every subject edit also confirmed the moment, and the editor is
+      -- only offered on an unsettled one, so it vanished after the first change. The way
+      -- back was Undo, which restores the model's reading and so discarded that change.
+      withSystemTempDirectory "petreport-spec" $ \dir ->
+        Db.withHandle (dbTracer renderingTracer) (dir </> "spec.db") $ \h -> do
+          let base = UTCTime (fromGregorian 2026 7 8) 0
+              ap sp = (anAppearance (AnAnimal (Species sp))) {activity = Sitting}
+              sc = emptyScene {appearances = [ap "cat", ap "dog"]}
+              reviewedOf i = fmap reviewed <$> Db.getObservation h i
+              subjectsOf i = fmap whoOf <$> Db.getObservation h i
+              whoOf o = case perception o of
+                Seen s  -> map who (appearances s)
+                Heard _ -> []
+          Db.insertObservation h [] (NewObservation base (Camera "office") PeriodicSample (Seen sc))
+          -- Three changes in a row, each leaving the moment open for the next.
+          Db.addObservationSighting h 1 APerson >>= (@?= Db.Added)
+          reviewedOf 1 >>= (@?= Just False)
+          Db.removeObservationSighting h 1 0 >>= (@?= True)
+          reviewedOf 1 >>= (@?= Just False)
+          Db.correctObservation h 1 0 (ToSpecies (Species "cat")) >>= (@?= True)
+          reviewedOf 1 >>= (@?= Just False)
+          subjectsOf 1 >>= (@?= Just [AnAnimal (Species "cat"), APerson])
+          -- The verdict, and only the verdict, settles it.
+          Db.markReviewed h [1]
+          reviewedOf 1 >>= (@?= Just True)
+          -- Taking the verdict back keeps every change that earned it.
+          Db.unreviewObservation h 1 >>= (@?= True)
+          reviewedOf 1 >>= (@?= Just False)
+          subjectsOf 1 >>= (@?= Just [AnAnimal (Species "cat"), APerson])
+          -- Reverting is the other, wider undo: back to what the model said.
+          Db.revertObservation h [] 1 >>= (@?= True)
+          subjectsOf 1 >>= (@?= Just [AnAnimal (Species "cat"), AnAnimal (Species "dog")])
+          -- An unknown id is not silently fine.
+          Db.unreviewObservation h 999 >>= (@?= False)
+  , testCase "a frame stops taking subjects at the cap" $
+      -- Each add counts again in the day's per-pet totals, so a stuck finger becomes a
+      -- number the owner cannot explain anywhere else in the app.
+      withSystemTempDirectory "petreport-spec" $ \dir ->
+        Db.withHandle (dbTracer renderingTracer) (dir </> "spec.db") $ \h -> do
+          let base = UTCTime (fromGregorian 2026 7 8) 0
+              sc = emptyScene {appearances = [(anAppearance (AnAnimal (Species "cat"))) {activity = Sitting}]}
+          Db.insertObservation h [] (NewObservation base (Camera "office") PeriodicSample (Seen sc))
+          outcomes <- mapM (const (Db.addObservationSighting h 1 APerson)) [1 .. Db.maxSightingsPerMoment]
+          -- Room for every add up to the cap, and none past it.
+          length (filter (== Db.Added) outcomes) @?= Db.maxSightingsPerMoment - 1
+          filter (/= Db.Added) outcomes @?= [Db.TooManySightings]
+          Db.addObservationSighting h 1 APerson >>= (@?= Db.TooManySightings)
+  , testCase "adding a subject the model missed, and removing one it invented" $
+      -- The other half of the reported bug: a frame the model read as one cat could be
+      -- called a cat OR a person and never both, because the only operation available
+      -- retargeted an existing sighting.
+      withSystemTempDirectory "petreport-spec" $ \dir ->
+        Db.withHandle (dbTracer renderingTracer) (dir </> "spec.db") $ \h -> do
+          let base = UTCTime (fromGregorian 2026 7 8) 0
+              ap sp = (anAppearance (AnAnimal (Species sp))) {activity = Sitting}
+              sc = emptyScene {appearances = [ap "cat"]}
+              whoOf o = case perception o of
+                Seen s  -> map who (appearances s)
+                Heard _ -> []
+          Db.insertObservation h [] (NewObservation base (Camera "office") PeriodicSample (Seen sc))
+          -- A person was there too. The cat stays.
+          added <- Db.addObservationSighting h 1 APerson
+          added @?= Db.Added
+          o1 <- Db.getObservation h 1
+          fmap whoOf o1 @?= Just [AnAnimal (Species "cat"), APerson]
+          -- A sound has no sightings to add to.
+          Db.insertObservation
+            h
+            []
+            (NewObservation base (Camera "hall") PeriodicSample (Heard (SoundKind "bark")))
+          Db.addObservationSighting h 2 APerson >>= (@?= Db.NoSightingsHere)
+          -- Now the renumbering case. Name the SECOND subject, then delete the first: the
+          -- surviving subject must keep its own identity rather than inherit the dead
+          -- one's row, which is what a positional key does if nothing remaps it.
+          Db.insertObservation
+            h
+            []
+            ( NewObservation
+                base
+                (Camera "den")
+                PeriodicSample
+                (Seen emptyScene {appearances = [ap "cat", ap "dog"]})
+            )
+          _ <- Db.correctObservation h 3 1 (ToPet (PetId "rex") (Species "dog"))
+          ovBefore <- Db.allAttributionsForObs h 3
+          Map.toList ovBefore @?= [((3, 1), Attribution (IdPet (PetId "rex")) Confirmed)]
+          removed <- Db.removeObservationSighting h 3 0
+          removed @?= True
+          o3 <- Db.getObservation h 3
+          fmap whoOf o3 @?= Just [AnAnimal (Species "dog")]
+          ovAfter <- Db.allAttributionsForObs h 3
+          Map.toList ovAfter @?= [((3, 0), Attribution (IdPet (PetId "rex")) Confirmed)]
+          -- Out of range is refused.
+          Db.removeObservationSighting h 3 9 >>= (@?= False)
+  , testCase "correcting one sighting in a two-animal frame leaves the other alone" $
+      -- The reported bug, at the layer that caused it. The override table has always been
+      -- keyed (obs_id, seq), but the writer took only an obs_id and fanned one identity
+      -- across every animal sighting, so naming the cat also relabelled the dog.
+      withSystemTempDirectory "petreport-spec" $ \dir ->
+        Db.withHandle (dbTracer renderingTracer) (dir </> "spec.db") $ \h -> do
+          let miso = Pet (PetId "miso") "Miso" (Species "cat") "grey cat" Nothing Nothing Nothing
+              rex = Pet (PetId "rex") "Rex" (Species "dog") "big dog" Nothing Nothing Nothing
+              roster' = [miso, rex]
+              base = UTCTime (fromGregorian 2026 7 8) 0
+              ap sp = (anAppearance (AnAnimal (Species sp))) {activity = Sitting}
+              person = (anAppearance APerson) {activity = Standing}
+              -- One frame: a cat, a dog, and the sitter.
+              sc = emptyScene {appearances = [ap "cat", ap "dog", person]}
+          Db.insertObservation h [] (NewObservation base (Camera "office") PeriodicSample (Seen sc))
+          -- Name only the dog.
+          ok <- Db.correctObservation h 1 1 (ToPet (PetId "rex") (Species "dog"))
+          ok @?= True
+          ov <- Db.allAttributionsForObs h 1
+          -- Exactly one override row, on the sighting that was named.
+          Map.toList ov @?= [((1, 1), Attribution (IdPet (PetId "rex")) Confirmed)]
+          -- The cat resolves by the roster's sole-cat rule, NOT to Rex.
+          identifyWith ov roster' (1, 0) (ap "cat") @?= KnownPet miso Confirmed
+          identifyWith ov roster' (1, 1) (ap "dog") @?= KnownPet rex Confirmed
+          -- Naming a sighting the model read as a person works: it settles the species
+          -- first, then assigns the pet. This used to be refused outright, which left the
+          -- owner unable to say "that is not a person, that is Rex".
+          named <- Db.correctObservation h 1 2 (ToPet (PetId "rex") (Species "dog"))
+          named @?= True
+          o' <- Db.getObservation h 1
+          fmap (\o -> case perception o of Seen s -> map who (appearances s); Heard _ -> []) o'
+            @?= Just [AnAnimal (Species "cat"), AnAnimal (Species "dog"), AnAnimal (Species "dog")]
+          ov' <- Db.allAttributionsForObs h 1
+          Map.lookup (1, 2) ov' @?= Just (Attribution (IdPet (PetId "rex")) Confirmed)
+          -- A sighting the scene does not hold is still refused.
+          outOfRange <- Db.correctObservation h 1 9 (ToPet (PetId "rex") (Species "dog"))
+          outOfRange @?= False
+  , testCase "SQL subjectStatsBetween agrees with blob presence, honouring overrides" $
       withSystemTempDirectory "petreport-spec" $ \dir ->
         Db.withHandle (dbTracer renderingTracer) (dir </> "spec.db") $ \h -> do
           let miso = Pet (PetId "miso") "Miso" (Species "cat") "grey cat" Nothing Nothing Nothing
@@ -980,27 +1473,25 @@ dbUnits =
               base = UTCTime (fromGregorian 2026 7 8) 0
               tk k = addUTCTime (fromInteger (k * 100)) base
               catAp eat =
-                Appearance
-                  (AnAnimal (Species "cat"))
-                  (if eat then Eating else Sleeping)
-                  (normalizeBehaviors (if eat then Eating else Sleeping) noBehaviors)
-                  Nothing
+                let act = if eat then Eating else Sleeping
+                 in (anAppearance (AnAnimal (Species "cat")))
+                      {activity = act, behaviors = normalizeBehaviors act noBehaviors}
               obsAt k eat =
                 NewObservation
                   (tk k)
                   (Camera "office")
                   PeriodicSample
                   (Seen emptyScene {appearances = [catAp eat]})
-          mapM_ (Db.insertObservation h) [obsAt 1 True, obsAt 2 False, obsAt 3 True]
+          mapM_ (Db.insertObservation h []) [obsAt 1 True, obsAt 2 False, obsAt 3 True]
           -- SQLite assigns ids 1..3 in insert order.
-          _ <- Db.correctObservation h 1 (ToPet (PetId "mochi"))
-          _ <- Db.correctObservation h 3 ToVisiting
+          _ <- Db.correctObservation h 1 0 (ToPet (PetId "mochi") (Species "cat"))
+          _ <- Db.correctObservation h 3 0 ToVisiting
           let lo = base
               hi = addUTCTime 100000 base
           obss <- Db.observationsBetween h lo hi
           ov <- Db.overridesBetween h lo hi
-          sqlStats <- Db.subjectStatsBetween h lo hi
-          let blob = presence ov twoCat obss
+          sqlStats <- storedStatsMap <$> Db.subjectStatsBetween h lo hi
+          let blob = resolvedStatsMap (presence ov twoCat obss)
               petOrSpecies k = case k of
                 KPet _     -> True
                 KSpecies _ -> True
@@ -1020,34 +1511,32 @@ dbUnits =
           let base = UTCTime (fromGregorian 2026 7 8) 0
               tk k = addUTCTime (fromInteger (k * 100)) base
               catAp eat =
-                Appearance
-                  (AnAnimal (Species "cat"))
-                  (if eat then Eating else Sleeping)
-                  (normalizeBehaviors (if eat then Eating else Sleeping) noBehaviors)
-                  Nothing
+                let act = if eat then Eating else Sleeping
+                 in (anAppearance (AnAnimal (Species "cat")))
+                      {activity = act, behaviors = normalizeBehaviors act noBehaviors}
               obsAt k eat =
                 NewObservation (tk k) (Camera "office") PeriodicSample (Seen emptyScene {appearances = [catAp eat]})
               -- A DOG appearance corrected to the (cat) pet Mochi, so Mochi spans two
               -- detected species: the rollup must SUM both groups into KPet, not drop one.
-              dogAp = Appearance (AnAnimal (Species "dog")) Sleeping (normalizeBehaviors Sleeping noBehaviors) Nothing
+              dogAp = (anAppearance (AnAnimal (Species "dog"))) {activity = Sleeping, behaviors = (normalizeBehaviors Sleeping noBehaviors)}
               obsDog k =
                 NewObservation (tk k) (Camera "office") PeriodicSample (Seen emptyScene {appearances = [dogAp]})
               lo = base
               hi = addUTCTime 100000 base
               day = "2026-07-08"
-          mapM_ (Db.insertObservation h) [obsAt 1 True, obsAt 2 False, obsAt 3 True, obsDog 4]
-          _ <- Db.correctObservation h 1 (ToPet (PetId "mochi"))
+          mapM_ (Db.insertObservation h []) [obsAt 1 True, obsAt 2 False, obsAt 3 True, obsDog 4]
+          _ <- Db.correctObservation h 1 0 (ToPet (PetId "mochi") (Species "cat"))
           -- The rollup for the day equals a live compute over the same window.
-          live <- Db.subjectStatsBetween h lo hi
+          live <- storedStatsMap <$> Db.subjectStatsBetween h lo hi
           Db.materializeDay h day lo hi
-          Db.dailyPetStats h day >>= (@?= live)
+          Db.dailyPetStats h day >>= (@?= live) . storedStatsMap
           -- Re-materialising after further corrections replaces the day cleanly, never
           -- doubling, and Mochi (now seen as both cat and dog) sums across both species.
-          _ <- Db.correctObservation h 2 (ToPet (PetId "mochi"))
-          _ <- Db.correctObservation h 4 (ToPet (PetId "mochi"))
-          live2 <- Db.subjectStatsBetween h lo hi
+          _ <- Db.correctObservation h 2 0 (ToPet (PetId "mochi") (Species "cat"))
+          _ <- Db.correctObservation h 4 0 (ToPet (PetId "mochi") (Species "cat"))
+          live2 <- storedStatsMap <$> Db.subjectStatsBetween h lo hi
           Db.materializeDay h day lo hi
-          rolled2 <- Db.dailyPetStats h day
+          rolled2 <- storedStatsMap <$> Db.dailyPetStats h day
           rolled2 @?= live2
           fmap psSightings (Map.lookup (KPet (PetId "mochi")) rolled2) @?= Just 3
   , testCase "GC collects un-kept moments in a window but spares the kept one" $
@@ -1056,11 +1545,11 @@ dbUnits =
           let base = UTCTime (fromGregorian 2026 7 8) 0
               tk k = addUTCTime (fromInteger (k * 100)) base
               catAp =
-                Appearance (AnAnimal (Species "cat")) Sleeping (normalizeBehaviors Sleeping noBehaviors) Nothing
+                (anAppearance (AnAnimal (Species "cat"))) {activity = Sleeping, behaviors = (normalizeBehaviors Sleeping noBehaviors)}
               obsAt k = NewObservation (tk k) (Camera "office") PeriodicSample (Seen emptyScene {appearances = [catAp]})
               lo = base
               hi = addUTCTime 100000 base
-          mapM_ (Db.insertObservation h) [obsAt 1, obsAt 2, obsAt 3]
+          mapM_ (Db.insertObservation h []) [obsAt 1, obsAt 2, obsAt 3]
           -- Keep the middle moment (SQLite assigns ids 1..3 in insert order).
           _ <- Db.insertKeepsake h 2 Nothing Nothing base
           -- The day has un-kept moments to collect, so GC would process it.
@@ -1075,7 +1564,7 @@ dbUnits =
           -- (which would shrink the full-day stats). The full-day rollup (3 sightings)
           -- is preserved.
           Db.hasUnkeptBetween h lo hi >>= (@?= False)
-          rolled <- Db.dailyPetStats h "2026-07-08"
+          rolled <- storedStatsMap <$> Db.dailyPetStats h "2026-07-08"
           fmap psSightings (Map.lookup (KSpecies (Species "cat")) rolled) @?= Just 3
   , -- The SINGLE-pet reconciliation in 'petStatFor' (finding 4): the SQL aggregate
     -- keys un-overridden sightings of a lone cat by KSpecies (it holds no roster
@@ -1093,11 +1582,7 @@ dbUnits =
               base = UTCTime (fromGregorian 2026 7 8) 0
               tk k = addUTCTime (fromInteger (k * 100)) base
               catAp act =
-                Appearance
-                  (AnAnimal (Species "cat"))
-                  act
-                  (normalizeBehaviors act noBehaviors)
-                  Nothing
+                (anAppearance (AnAnimal (Species "cat"))) {activity = act, behaviors = (normalizeBehaviors act noBehaviors)}
               obsAt k act =
                 NewObservation
                   (tk k)
@@ -1106,24 +1591,24 @@ dbUnits =
                   (Seen emptyScene {appearances = [catAp act]})
           -- A mix of un-overridden cat sightings plus one explicit override to the
           -- pet: obs 1 eats, obs 2 sleeps, obs 3 drinks.
-          mapM_ (Db.insertObservation h) [obsAt 1 Eating, obsAt 2 Sleeping, obsAt 3 Drinking]
+          mapM_ (Db.insertObservation h []) [obsAt 1 Eating, obsAt 2 Sleeping, obsAt 3 Drinking]
           -- SQLite assigns ids 1..3 in insert order; correct obs 1 to the pet so the
           -- SQL path yields a KPet bucket while obs 2/3 stay in KSpecies.
-          _ <- Db.correctObservation h 1 (ToPet (PetId "dexter"))
+          _ <- Db.correctObservation h 1 0 (ToPet (PetId "dexter") (Species "cat"))
           let lo = base
               hi = addUTCTime 100000 base
           obss <- Db.observationsBetween h lo hi
           ov <- Db.overridesBetween h lo hi
-          sqlStats <- Db.subjectStatsBetween h lo hi
+          sqlStats <- storedStatsMap <$> Db.subjectStatsBetween h lo hi
           -- The SQL path splits the lone cat across KPet (override) and KSpecies
           -- (un-overridden); petStatFor must fold both into the pet's stat.
           fmap psSightings (Map.lookup (KPet (PetId "dexter")) sqlStats) @?= Just 1
           fmap psSightings (Map.lookup (KSpecies (Species "cat")) sqlStats) @?= Just 2
-          let blob = presence ov roster obss
+          let blob = resolvedStatsMap (presence ov roster obss)
           -- The blob path resolves EVERY sighting to KPet via the unique-species rule.
           fmap psSightings (Map.lookup (KPet (PetId "dexter")) blob) @?= Just 3
           -- The invariant: petStatFor over the SQL aggregate equals the blob KPet bucket.
-          petStatFor roster dexter sqlStats @?= Map.lookup (KPet (PetId "dexter")) blob
+          petStatFor roster dexter (StoredStats sqlStats) @?= Map.lookup (KPet (PetId "dexter")) blob
   , testCase "reprojectAll preserves overrides; a person correction clears them" $
       withSystemTempDirectory "petreport-spec2" $ \dir ->
         Db.withHandle (dbTracer renderingTracer) (dir </> "spec.db") $ \h -> do
@@ -1133,9 +1618,9 @@ dbUnits =
                   base
                   (Camera "office")
                   PeriodicSample
-                  (Seen emptyScene {appearances = [Appearance (AnAnimal (Species "cat")) Sleeping noBehaviors Nothing]})
-          Db.insertObservation h catObs
-          _ <- Db.correctObservation h 1 (ToPet (PetId "mochi"))
+                  (Seen emptyScene {appearances = [(anAppearance (AnAnimal (Species "cat"))) {activity = Sleeping}]})
+          Db.insertObservation h [] catObs
+          _ <- Db.correctObservation h 1 0 (ToPet (PetId "mochi") (Species "cat"))
           let lo = addUTCTime (-100) base
               hi = addUTCTime 100 base
           before <- Db.overridesBetween h lo hi
@@ -1143,9 +1628,9 @@ dbUnits =
           after <- Db.overridesBetween h lo hi
           -- Re-projecting the facts table must not touch the override table.
           after @?= before
-          Map.lookup (1, 0) after @?= Just (IdPet (PetId "mochi"))
+          Map.lookup (1, 0) after @?= Just (Attribution (IdPet (PetId "mochi")) Confirmed)
           -- Correcting to a person clears the pet override for that observation.
-          _ <- Db.correctObservation h 1 ToPerson
+          _ <- Db.correctObservation h 1 0 ToPerson
           cleared <- Db.overridesBetween h lo hi
           Map.lookup (1, 0) cleared @?= Nothing
   , testCase "purgePetAndProfile erases the pet's data and drops it from the roster in one call" $
@@ -1160,14 +1645,14 @@ dbUnits =
                   (addUTCTime (fromInteger (k * 100)) base)
                   (Camera "office")
                   PeriodicSample
-                  (Seen emptyScene {appearances = [Appearance (AnAnimal (Species "cat")) Sleeping noBehaviors Nothing]})
+                  (Seen emptyScene {appearances = [(anAppearance (AnAnimal (Species "cat"))) {activity = Sleeping}]})
           -- Seed a two-pet roster and mochi's cached summary.
           Db.putProfile h emptyProfile {pets = [miso, mochi]}
           Db.putPetSummary h "mochi" base (Db.PetSummary Settled (Just "a good week") [])
-          mapM_ (Db.insertObservation h) [catObs 1, catObs 2, catObs 3, catObs 4]
-          _ <- Db.correctObservation h 1 (ToPet (PetId "mochi")) -- mochi's moment
-          _ <- Db.correctObservation h 2 (ToPet (PetId "miso")) -- miso's moment
-          _ <- Db.correctObservation h 3 (ToPet (PetId "miso")) -- miso's, but was kept as mochi
+          mapM_ (Db.insertObservation h []) [catObs 1, catObs 2, catObs 3, catObs 4]
+          _ <- Db.correctObservation h 1 0 (ToPet (PetId "mochi") (Species "cat")) -- mochi's moment
+          _ <- Db.correctObservation h 2 0 (ToPet (PetId "miso") (Species "cat")) -- miso's moment
+          _ <- Db.correctObservation h 3 0 (ToPet (PetId "miso") (Species "cat")) -- miso's, but was kept as mochi
           _ <- Db.insertKeepsake h 3 (Just "mochi") Nothing base
           _ <- Db.insertKeepsake h 4 (Just "mochi") Nothing base -- kept as mochi, never corrected
           deleted <-
@@ -1180,8 +1665,8 @@ dbUnits =
           sort [i | o <- survivors, let ObsId i = obsId o] @?= [2, 3]
           ov <- Db.overridesBetween h base hi
           Map.lookup (1, 0) ov @?= Nothing
-          Map.lookup (2, 0) ov @?= Just (IdPet (PetId "miso"))
-          Map.lookup (3, 0) ov @?= Just (IdPet (PetId "miso"))
+          Map.lookup (2, 0) ov @?= Just (Attribution (IdPet (PetId "miso")) Confirmed)
+          Map.lookup (3, 0) ov @?= Just (Attribution (IdPet (PetId "miso")) Confirmed)
           -- All of mochi's keepsakes gone (incl. the stale one on obs 3).
           ks <- Db.listKeepsakes h Nothing
           length ks @?= 0
@@ -1189,6 +1674,35 @@ dbUnits =
           Db.getPetSummary h "mochi" >>= (@?= Nothing)
           prof <- Db.getProfile h
           sort [p | Pet {petId = PetId p} <- pets prof] @?= ["miso"]
+  , testCase "the needs-look backlog holds concerning moments, not only uncertain ones" $
+      withSystemTempDirectory "petreport-needslook" $ \dir ->
+        Db.withHandle (dbTracer renderingTracer) (dir </> "spec.db") $ \h -> do
+          let base = UTCTime (fromGregorian 2026 7 8) 0
+              at k = addUTCTime (fromInteger (k * 100)) base
+              scene wb =
+                Seen
+                  emptyScene
+                    { appearances = [(anAppearance (AnAnimal (Species "cat"))) {activity = Sleeping}]
+                    , wellbeing = wb
+                    , confidence = Just (mkConfidence 0.95)
+                    }
+              new k = NewObservation (at k) (Camera "office") PeriodicSample
+          -- 1 is settled and confident. 2 is concerning but just as confident, and 3 is a
+          -- safety sound, which carries no confidence to be unsure about. Neither 2 nor 3 is
+          -- uncertain, so before the backlog widened both were counted by the Today badge
+          -- while no facet could retrieve them.
+          mapM_
+            (Db.insertObservation h [])
+            [new 1 (scene Normal), new 2 (scene Concerning), new 3 (Heard (SoundKind "glass"))]
+          let bq0 = Db.emptyBrowseQuery {Db.bqSort = Db.Asc}
+              ids p = [i | o <- Db.bpItems p, let ObsId i = obsId o]
+          nl <- Db.browseMoments h bq0 {Db.bqReview = Just Db.NeedsLook}
+          ids nl @?= [2, 3]
+          Db.bpTotal nl @?= Just 2
+          -- Reviewing one drops it, so the count falls as the owner works through them.
+          Db.markReviewed h [2]
+          nl2 <- Db.browseMoments h bq0 {Db.bqReview = Just Db.NeedsLook}
+          ids nl2 @?= [3]
   , testCase "browseMoments facets, keyset-pages, and honours sort direction" $
       withSystemTempDirectory "petreport-browse" $ \dir ->
         Db.withHandle (dbTracer renderingTracer) (dir </> "spec.db") $ \h -> do
@@ -1201,22 +1715,21 @@ dbUnits =
                   PeriodicSample
                   ( Seen
                       emptyScene
-                        { appearances = [Appearance (AnAnimal (Species "cat")) act noBehaviors Nothing]
+                        { appearances = [(anAppearance (AnAnimal (Species "cat"))) {activity = act}]
                         , confidence = Just (mkConfidence conf)
                         }
                   )
           -- obs 1,3 sleeping (certain); obs 2 playing (certain); obs 4 sleeping but
           -- low-confidence, so uncertain and unreviewed (the needs-look backlog).
           mapM_
-            (Db.insertObservation h)
+            (Db.insertObservation h [])
             [cat Sleeping 0.9 1, cat Playing 0.9 2, cat Sleeping 0.9 3, cat Sleeping 0.4 4]
-          let bq0 =
-                Db.BrowseQuery
-                  Nothing Nothing Nothing Nothing Nothing Nothing Nothing Nothing Nothing Nothing
-                  Db.Asc Nothing 50
+          -- Named overrides on the empty query, not a positional constructor call: adding
+          -- or removing a facet then cannot silently shift what this fixture means.
+          let bq0 = Db.emptyBrowseQuery {Db.bqSort = Db.Asc}
               ids p = [i | o <- Db.bpItems p, let ObsId i = obsId o]
           -- Activity facet resolves to the projected activity column.
-          play <- Db.browseMoments h bq0 {Db.bqActivity = Just "playing"}
+          play <- Db.browseMoments h bq0 {Db.bqActivity = Just Playing}
           ids play @?= [2]
           -- Needs-look facet: only the uncertain, unreviewed moment.
           nl <- Db.browseMoments h bq0 {Db.bqReview = Just Db.NeedsLook}
@@ -1236,10 +1749,10 @@ dbUnits =
           -- Pet facet mirrors the stats attribution. Correct obs 2 to a specific pet;
           -- the unique-active-species branch then counts every unattributed cat too,
           -- while the no-species branch counts only the explicit override.
-          _ <- Db.correctObservation h 2 (ToPet (PetId "mochi"))
-          allCats <- Db.browseMoments h bq0 {Db.bqPet = Just (Db.PetFilter "mochi" (Just "cat"))}
+          _ <- Db.correctObservation h 2 0 (ToPet (PetId "mochi") (Species "cat"))
+          allCats <- Db.browseMoments h bq0 {Db.bqSubjects = [Db.SubjPet (Db.PetFilter "mochi" (Just "cat"))]}
           ids allCats @?= [1, 2, 3, 4]
-          onlyMochi <- Db.browseMoments h bq0 {Db.bqPet = Just (Db.PetFilter "mochi" Nothing)}
+          onlyMochi <- Db.browseMoments h bq0 {Db.bqSubjects = [Db.SubjPet (Db.PetFilter "mochi" Nothing)]}
           ids onlyMochi @?= [2]
           -- Free-text search over the perception blob: every cat matches "cat", none a miss.
           hits <- Db.browseMoments h bq0 {Db.bqSearch = Just "cat"}
@@ -1260,22 +1773,22 @@ dbUnits =
               at k = addUTCTime (fromInteger (k * 100)) base
           -- 1: a scene the model returned empty (nothing identifiable) writes no
           --    subject rows, yet it is still a photo, so it must NOT read as audio.
-          Db.insertObservation h (NewObservation (at 1) (Camera "office") PeriodicSample (Seen emptyScene))
+          Db.insertObservation h [] (NewObservation (at 1) (Camera "office") PeriodicSample (Seen emptyScene))
           -- 2: an ordinary scene sample, a photo.
           Db.insertObservation
             h
+            []
             ( NewObservation
                 (at 2)
                 (Camera "office")
                 PeriodicSample
-                (Seen emptyScene {appearances = [Appearance (AnAnimal (Species "cat")) Sleeping noBehaviors Nothing]})
+                (Seen emptyScene {appearances = [(anAppearance (AnAnimal (Species "cat"))) {activity = Sleeping}]})
             )
           -- 3: a sound, which is audio whether or not it has any subject rows.
-          Db.insertObservation h (NewObservation (at 3) (Camera "office") PeriodicSample (Heard (SoundKind "bark")))
-          let bq0 =
-                Db.BrowseQuery
-                  Nothing Nothing Nothing Nothing Nothing Nothing Nothing Nothing Nothing Nothing
-                  Db.Asc Nothing 50
+          Db.insertObservation h [] (NewObservation (at 3) (Camera "office") PeriodicSample (Heard (SoundKind "bark")))
+          -- Named overrides on the empty query, not a positional constructor call: adding
+          -- or removing a facet then cannot silently shift what this fixture means.
+          let bq0 = Db.emptyBrowseQuery {Db.bqSort = Db.Asc}
               ids p = [i | o <- Db.bpItems p, let ObsId i = obsId o]
           audio <- Db.browseMoments h bq0 {Db.bqMedia = Just Db.MediaAudio}
           ids audio @?= [3]
@@ -1290,8 +1803,8 @@ dbUnits =
                   base
                   (Camera "office")
                   PeriodicSample
-                  (Seen emptyScene {appearances = [Appearance (AnAnimal (Species "cat")) Sleeping noBehaviors Nothing]})
-          Db.insertObservation h catObs
+                  (Seen emptyScene {appearances = [(anAppearance (AnAnimal (Species "cat"))) {activity = Sleeping}]})
+          Db.insertObservation h [] catObs
           _ <- Db.insertKeepsake h 1 (Just "mochi") (Just "nap") base
           Db.listKeepsakes h Nothing >>= ((@?= 1) . length)
           -- No manual keepsake delete: the FK's ON DELETE CASCADE must take it.
@@ -1306,8 +1819,8 @@ dbUnits =
                   base
                   (Camera "office")
                   PeriodicSample
-                  (Seen emptyScene {appearances = [Appearance (AnAnimal (Species "cat")) Sleeping noBehaviors Nothing]})
-          Db.insertObservation h catObs
+                  (Seen emptyScene {appearances = [(anAppearance (AnAnimal (Species "cat"))) {activity = Sleeping}]})
+          Db.insertObservation h [] catObs
           -- Keep the same moment twice (the Lightbox re-Keep after navigating away).
           first <- Db.insertKeepsake h 1 (Just "mochi") (Just "nap") base
           second <- Db.insertKeepsake h 1 (Just "mochi") (Just "later caption") base
@@ -1329,9 +1842,9 @@ dbUnits =
                   (addUTCTime (fromInteger (k * 100)) base)
                   (Camera "office")
                   PeriodicSample
-                  (Seen emptyScene {appearances = [Appearance (AnAnimal (Species "cat")) Sleeping noBehaviors Nothing]})
-          mapM_ (Db.insertObservation h) [catObs 1, catObs 2, catObs 3]
-          _ <- Db.correctObservation h 2 (ToPet (PetId "mochi"))
+                  (Seen emptyScene {appearances = [(anAppearance (AnAnimal (Species "cat"))) {activity = Sleeping}]})
+          mapM_ (Db.insertObservation h []) [catObs 1, catObs 2, catObs 3]
+          _ <- Db.correctObservation h 2 0 (ToPet (PetId "mochi") (Species "cat"))
           -- The batch read is keyed by id and holds exactly the ids that exist; a
           -- missing id (99) is simply absent, as the single-row Nothing would drop it.
           byId <- Db.getObservationsByIds h [1, 2, 3, 99]
@@ -1342,11 +1855,11 @@ dbUnits =
           -- An empty id list short-circuits to no query and an empty map.
           Db.getObservationsByIds h [] >>= ((@?= []) . Map.keys)
           -- The batched overrides equal the union of the per-obs overrides.
-          batchedOv <- Db.overridesForObsIds h [1, 2, 3]
-          perObs <- mconcat <$> mapM (Db.overridesForObs h) [1, 2, 3]
+          batchedOv <- Db.countedAttributionsForObsIds h [1, 2, 3]
+          perObs <- mconcat <$> mapM (Db.allAttributionsForObs h) [1, 2, 3]
           batchedOv @?= perObs
-          Map.lookup (2, 0) batchedOv @?= Just (IdPet (PetId "mochi"))
-          Db.overridesForObsIds h [] >>= ((@?= []) . Map.keys)
+          Map.lookup (2, 0) batchedOv @?= Just (Attribution (IdPet (PetId "mochi")) Confirmed)
+          Db.countedAttributionsForObsIds h [] >>= ((@?= []) . Map.keys)
   , testCase "markReviewed marks every id in the batch" $
       withSystemTempDirectory "petreport-reviewed" $ \dir ->
         Db.withHandle (dbTracer renderingTracer) (dir </> "spec.db") $ \h -> do
@@ -1357,8 +1870,8 @@ dbUnits =
                   (addUTCTime (fromInteger (k * 100)) base)
                   (Camera "office")
                   PeriodicSample
-                  (Seen emptyScene {appearances = [Appearance (AnAnimal (Species "cat")) Sleeping noBehaviors Nothing]})
-          mapM_ (Db.insertObservation h) [catObs 1, catObs 2, catObs 3]
+                  (Seen emptyScene {appearances = [(anAppearance (AnAnimal (Species "cat"))) {activity = Sleeping}]})
+          mapM_ (Db.insertObservation h []) [catObs 1, catObs 2, catObs 3]
           Db.markReviewed h [1, 2, 3]
           obss <- Db.observationsBetween h base hi
           sort [i | Observation {obsId = ObsId i, reviewed = r} <- obss, r] @?= [1, 2, 3]
@@ -1372,15 +1885,53 @@ dbUnits =
       isJust (Migrations.schemaTooNew (Db.latestSchemaVersion + 1)) @?= True
       Migrations.schemaTooNew Db.latestSchemaVersion @?= Nothing
       Migrations.schemaTooNew 0 @?= Nothing
+  , testCase "migration 2 renames the backlog column and backfills concerning moments" $
+      withSystemTempDirectory "petreport-migrate2" $ \dir -> do
+        let path = dir </> "v1.db"
+        -- Build a database stopped at version 1, holding the row shapes migration 2 has to
+        -- notice. All three are uncertain = 0, which is exactly the problem: under v1 a
+        -- concerning moment sat outside the backlog however worrying it was.
+        SQL.withConnection path $ \c -> do
+          -- One transaction, as 'migrate' itself uses: seventeen autocommitted CREATEs
+          -- cost an fsync each and dominate this test's runtime.
+          SQL.withTransaction c $
+            maybe
+              (assertFailure "expected a version 1 migration")
+              (mapM_ (SQL.execute_ c))
+              (lookup 1 Migrations.migrations)
+          SQL.execute_ c "PRAGMA user_version = 1"
+          let row :: Double -> Text -> IO ()
+              row ts perc =
+                SQL.execute
+                  c
+                  "INSERT INTO observations (ts, camera, source, perception, reviewed, uncertain) \
+                  \VALUES (?, 'office', 'sample', ?, 0, 0)"
+                  (ts, perc)
+          row 1 "{\"kind\":\"sound\",\"sound\":\"glass\"}"
+          row 2 "{\"kind\":\"scene\",\"scene\":{\"appearances\":[],\"wellbeing\":\"concerning\"}}"
+          row 3 "{\"kind\":\"scene\",\"scene\":{\"appearances\":[],\"wellbeing\":\"normal\"}}"
+          -- A sound that is not a safety sound stays out, so the backfill is not just
+          -- "every sound".
+          row 4 "{\"kind\":\"sound\",\"sound\":\"bark\"}"
+        -- Opening through the handle applies the pending migration.
+        Db.withHandle (dbTracer renderingTracer) path $
+          Db.schemaVersion >=> (@?= Db.latestSchemaVersion)
+        SQL.withConnection path $ \c -> do
+          flagged <-
+            SQL.query_ c "SELECT ts FROM observations WHERE needs_look = 1 ORDER BY ts"
+              :: IO [SQL.Only Double]
+          map SQL.fromOnly flagged @?= [1, 2]
   , testCase "a populated DB carrying no schema version is refused, not built over" $ do
       -- SQLite reports an unstamped database as version 0, exactly like a fresh file, so
       -- the number alone cannot tell them apart. Building v1 over a populated one dies on
       -- its first CREATE TABLE with a raw SQLite error; it must fail fast with a fix.
-      Migrations.unversionedButPopulated [] @?= Nothing
+      let v1 = Migrations.ObservedSchema Migrations.schemaV1Tables ["ts", "uncertain"]
+          v2 = Migrations.ObservedSchema Migrations.schemaV1Tables ["ts", "needs_look"]
+      Migrations.unversionedButPopulated (Migrations.ObservedSchema [] []) @?= Nothing
       -- An unrelated file: name what was found and what was expected, and say to move it
       -- aside. Stamping this one would only trade a clear startup error for an opaque
       -- "no such table" on the first query.
-      case Migrations.unversionedButPopulated ["observations", "profile"] of
+      case Migrations.unversionedButPopulated (Migrations.ObservedSchema ["observations", "profile"] []) of
         Nothing -> assertFailure "expected a refusal for a populated unstamped database"
         Just m -> do
           let msg = pack m
@@ -1388,14 +1939,25 @@ dbUnits =
           ("Move the file aside" `isInfixOf` msg) @?= True
           ("PRAGMA user_version" `isInfixOf` msg) @?= False
       -- The full v1 table set with no stamp is what a .dump-and-restore of a healthy
-      -- database produces. That operator must be told to restore the stamp, never to
-      -- delete: the data is intact.
-      case Migrations.unversionedButPopulated Migrations.schemaV1Tables of
+      -- database produces. That owner must be told to restore the stamp, never to delete:
+      -- the data is intact.
+      --
+      -- Which stamp depends on the schema the dump carried, and the table names cannot say,
+      -- since version 2 only renames a column. Naming the latest version for a v1 file would
+      -- skip migration 2 and leave every needs-look query reading a column that was never
+      -- renamed.
+      Migrations.inferSchemaVersion v1 @?= Just 1
+      Migrations.inferSchemaVersion v2 @?= Just 2
+      Migrations.inferSchemaVersion (Migrations.ObservedSchema ["observations"] []) @?= Nothing
+      case Migrations.unversionedButPopulated v1 of
         Nothing -> assertFailure "expected a refusal for an unstamped v1 database"
         Just m -> do
           let msg = pack m
           ("PRAGMA user_version = 1" `isInfixOf` msg) @?= True
           ("Do not delete" `isInfixOf` msg) @?= True
+      case Migrations.unversionedButPopulated v2 of
+        Nothing -> assertFailure "expected a refusal for an unstamped v2 database"
+        Just m -> ("PRAGMA user_version = 2" `isInfixOf` pack m) @?= True
       -- The set is recovered from the DDL, so it cannot drift from what migrate applies.
       assertBool "v1 creates several tables" (length Migrations.schemaV1Tables >= 5)
       ("observations" `elem` Migrations.schemaV1Tables) @?= True
