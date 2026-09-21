@@ -22,7 +22,7 @@
   import { live as liveOverlay, openLive, closeLive } from './liveview.svelte'
   import { day } from './day.svelte'
   import { refreshes } from './refresh.svelte'
-  import { greeting, longDate, chipFg, roomTint, fmtTime, friendlyError, frameSrc, ymdForOffset } from './ui'
+  import { greeting, longDate, dayDate, chipFg, chipStyle, roomTint, fmtTime, friendlyError, frameSrc, ymdForOffset } from './ui'
   import { toggleTheme, theme } from './theme.svelte'
   import { layout } from './layout.svelte'
   import { onDestroy } from 'svelte'
@@ -40,6 +40,10 @@
   let dayKey = $derived(ymdForOffset(day.offset))
   let refreshing = $derived(refreshes.isRefreshing(dayKey))
   let refreshed = $derived(refreshes.updatedIso === dayKey)
+  // False when this day still has camera events the app has not worked through, so its
+  // moments and its story are both incomplete. Defaults to true so nothing flashes up
+  // before the first check answers.
+  let caughtUp = $state(true)
   let dismissed = $state(false)
   let recapText = $state('')
   let recapBusy = $state(false)
@@ -55,10 +59,17 @@
     try {
       // The day's moments and the per-pet glance for that day, fetched together.
       // A past day gets its glance from the dated endpoint so its cards reflect it.
-      const [d, g] = await Promise.all([api.day(iso), api.insights(day.offset === 0 ? undefined : iso)])
+      const [d, g, s] = await Promise.all([
+        api.day(iso),
+        api.insights(day.offset === 0 ? undefined : iso),
+        // Whether this day's events have all been looked at yet. A failure here must never
+        // break the day, so it degrades to hiding the notice.
+        api.refreshStatus(day.offset === 0 ? undefined : iso).catch(() => null),
+      ])
       if (!alive || day.iso !== iso) return
       data = d
       glance = g
+      caughtUp = s?.caughtUp ?? true
       if (day.offset === 0) {
         // Live cameras and the earliest-day bound only make sense for today.
         overview = await api.overview()
@@ -87,10 +98,15 @@
       .catch(() => {})
   })
 
-  // Poll a day's batch flag until its run finishes, with a safety cap (~3 min) so a
-  // hung run can never wedge the spinner; stops early if the view is unmounted.
+  // Poll a day's batch flag until its run finishes, with a safety cap so a hung run can
+  // never wedge the spinner; stops early if the view is unmounted.
+  //
+  // The cap has to sit above the server's own batch deadline (20 minutes), or it fires on
+  // runs that are merely long: the spinner clears while the run is still working, and the
+  // outcome read afterwards is the PREVIOUS run's record, since this one has not written
+  // its own yet.
   async function pollUntilIdle(arg?: string) {
-    const deadline = Date.now() + 3 * 60 * 1000
+    const deadline = Date.now() + 25 * 60 * 1000
     while (alive && Date.now() < deadline) {
       await new Promise((r) => setTimeout(r, 2000))
       if (!alive) return
@@ -148,14 +164,48 @@
   }
 
   let obs = $derived(data?.moments ?? [])
-  let alert = $derived(day.offset === 0 && !dismissed ? obs.find((o) => o.wellbeing === 'concerning') : undefined)
-  let concerningCount = $derived(obs.filter((o) => o.wellbeing === 'concerning').length)
+  // The day's concerns still waiting on you, stated once so the heads-up and the badge cannot
+  // disagree. Both are gated on needsReview, so reviewing one drops it from both and from the
+  // list they open. The badge used to count moments no filter could retrieve, leaving it
+  // nowhere to send you.
+  //
+  // It counts a SUBSET of that list, which also holds whatever the model was unsure about.
+  // Identical today, since a missing confidence never trips the unsure threshold; they part
+  // company once confidence is populated, and the honest fix then is a concerning facet in
+  // Review rather than a looser count here.
+  // The badge's count and the query its link opens, defined once. The count filters the
+  // day's loaded moments; the query asks the server for the same set. Previously the link
+  // fell back to the needs-a-look backlog, a strict superset of what the badge counted, so
+  // the list was reliably longer than the number that opened it.
+  let concerningQuery = $derived<ReviewPreset>({
+    from: ymdForOffset(day.offset),
+    to: ymdForOffset(day.offset),
+    wellbeing: 'concerning',
+    review: 'unreviewed',
+  })
+  let concerning = $derived(obs.filter((o) => o.wellbeing === 'concerning' && o.needsReview))
+  // Likewise for the presence note. This is the link that used to carry a fabricated pet
+  // id of 'visitor' and land on an empty page.
+  let personQuery = $derived<ReviewPreset>({
+    from: ymdForOffset(day.offset),
+    to: ymdForOffset(day.offset),
+    subject: [{ kind: 'person' }],
+  })
+  let alert = $derived(day.offset === 0 && !dismissed ? concerning[0] : undefined)
+  let concerningCount = $derived(concerning.length)
   let live = $derived(overview?.cameras ?? [])
-  // On today the badge shows the GLOBAL needs-a-look backlog (contract D1); a past day
-  // shows its own day-scoped count.
-  let needsCount = $derived(
-    day.offset === 0 ? (overview?.pendingReview ?? 0) : obs.filter((o) => o.needsReview).length,
-  )
+  // The moments this day holds that are still queued: ones the model was unsure about, plus
+  // ones flagged concerning. The same day-scoped rule for today and any past day (contract
+  // D1). It used to show the global backlog on today, so one old moment read as if today had
+  // one to review.
+  let needsCount = $derived(obs.filter((o) => o.needsReview).length)
+  // The review nudge counts this day's flagged-or-unsure moments, so its link says the
+  // same thing: the needs-a-look backlog scoped to the day in view.
+  let needsQuery = $derived<ReviewPreset>({
+    from: ymdForOffset(day.offset),
+    to: ymdForOffset(day.offset),
+    review: 'needs-look',
+  })
 
   // Cache-busting tick for the "Right now" stills, so they refresh instead of freezing on
   // the first frame. Runs only while those tiles are shown (today, with cameras) and pauses
@@ -202,7 +252,7 @@
     <div class="mb-[11px] flex items-center justify-between gap-[8px]">
       <div class="flex items-center gap-[8px]"><span class="h-[8px] w-[8px] rounded-full" style="background:var(--accent);box-shadow:0 0 12px var(--accent)"></span><span class="font-head text-[16px] font-semibold" style="color:var(--text)">{day.offset === 0 ? 'Today so far' : 'Summary'}</span></div>
       {#if concerningCount > 0}
-        <span class="rounded-full px-[11px] py-[5px] text-[11.5px] font-extrabold" style="background:rgba(236,177,99,0.16);color:var(--watch)">{concerningCount} to check</span>
+        <button onclick={() => onnav('review', concerningQuery)} class="tappable rounded-full px-[11px] py-[5px] text-[11.5px] font-extrabold" style="{chipStyle('watch')};border:none">{concerningCount} to check ›</button>
       {:else if obs.length === 0}
         <span class="rounded-full px-[11px] py-[5px] text-[11.5px] font-extrabold" style="background:rgba(255,246,236,0.06);color:var(--muted)">Nothing captured</span>
       {:else}
@@ -211,7 +261,7 @@
     </div>
     <div class="relative text-[15px] leading-[1.55]" style="color:var(--text);opacity:.92"><TimeText text={data?.narrative ?? 'No summary yet for this day. The cameras are often off, so a quiet log is perfectly normal.'} date={ymdForOffset(day.offset)} {onnav} /></div>
     {#if data?.presence?.someoneHome}
-      <button onclick={() => onnav('review', 'visitor')} class="mt-[11px] inline-flex items-center gap-[6px] text-[12px] font-semibold" style="background:none;border:none;padding:0;color:var(--muted)"><span style="opacity:.7">⌂</span> Someone was home {day.offset === 0 ? 'today' : 'that day'} <span style="color:var(--accent)">›</span></button>
+      <button onclick={() => onnav('review', personQuery)} class="mt-[11px] inline-flex items-center gap-[6px] text-[12px] font-semibold" style="background:none;border:none;padding:0;color:var(--muted)"><span style="opacity:.7">⌂</span> Someone was home {day.offset === 0 ? 'today' : 'that day'} <span style="color:var(--accent)">›</span></button>
     {/if}
     <div class="mt-[15px] flex flex-wrap gap-[9px]">
       <button onclick={refresh} disabled={refreshing} class="inline-flex items-center gap-[7px] rounded-full px-[16px] py-[9px] text-[13px] font-extrabold whitespace-nowrap disabled:opacity-70" style="background:var(--accent);color:var(--ink);border:none"><span style="display:inline-block;{refreshing ? 'animation:petSpin .9s linear infinite' : ''}">↻</span> {refreshing ? 'Looking...' : refreshed ? 'Just updated' : 'Refresh'}</button>
@@ -297,11 +347,33 @@
   {/if}
 {/snippet}
 
+{#snippet catchUpNotice()}
+  <!-- shown only while this day still has events waiting to be looked at -->
+  {#if !caughtUp}
+    <button
+      onclick={refresh}
+      disabled={refreshing}
+      class="tappable mb-[16px] flex w-full items-center gap-[12px] rounded-[20px] p-[14px_15px] text-left"
+      style="background:rgba(236,177,99,0.1);border:1px solid rgba(236,177,99,0.3);color:inherit">
+      <span class="flex h-[38px] w-[38px] flex-shrink-0 items-center justify-center rounded-xl" style="background:var(--watch);color:#3a2a10"><Paw size={20} /></span>
+      <div class="min-w-0 flex-1">
+        <div class="font-head text-[15.5px] font-semibold" style="color:var(--text)">Still catching up</div>
+        <div class="mt-[1px] text-[12px]" style="color:var(--muted)">
+          {refreshing
+            ? 'Working through the rest now'
+            : "This day still has camera events to look at, so its story may be incomplete. Tap to work through them; a busy day can take more than one go."}
+        </div>
+      </div>
+      <span class="flex-shrink-0 text-[19px]" style="color:var(--faint)">›</span>
+    </button>
+  {/if}
+{/snippet}
+
 {#snippet needsNudge()}
   <!-- needs a look nudge -->
-  <button onclick={() => onnav('review', needsCount > 0 ? 'needs' : undefined)} class="tappable mb-[16px] flex w-full items-center gap-[12px] rounded-[20px] p-[14px_15px] text-left" style="background:{needsCount > 0 ? 'rgba(236,177,99,0.1)' : 'rgba(163,192,143,0.1)'};border:1px solid {needsCount > 0 ? 'rgba(236,177,99,0.3)' : 'rgba(163,192,143,0.28)'};color:inherit">
+  <button onclick={() => onnav('review', needsCount > 0 ? needsQuery : undefined)} class="tappable mb-[16px] flex w-full items-center gap-[12px] rounded-[20px] p-[14px_15px] text-left" style="background:{needsCount > 0 ? 'rgba(236,177,99,0.1)' : 'rgba(163,192,143,0.1)'};border:1px solid {needsCount > 0 ? 'rgba(236,177,99,0.3)' : 'rgba(163,192,143,0.28)'};color:inherit">
     <span class="flex h-[38px] w-[38px] flex-shrink-0 items-center justify-center rounded-xl" style="background:{needsCount > 0 ? 'var(--watch)' : 'var(--good)'};color:{needsCount > 0 ? '#3a2a10' : '#1f3018'}">{#if needsCount > 0}<Paw size={20} />{:else}<span class="text-[17px] font-black">✓</span>{/if}</span>
-    <div class="min-w-0 flex-1"><div class="font-head text-[15.5px] font-semibold" style="color:var(--text)">{needsCount > 0 ? `${needsCount} moment${needsCount === 1 ? '' : 's'} to review` : 'All caught up'}</div><div class="mt-[1px] text-[12px]" style="color:var(--muted)">{needsCount > 0 ? "A few I'm not sure about, tap to take a look" : `Nothing needs your eyes ${day.offset === 0 ? 'today' : 'that day'}`}</div></div>
+    <div class="min-w-0 flex-1"><div class="font-head text-[15.5px] font-semibold" style="color:var(--text)">{needsCount > 0 ? `${needsCount} moment${needsCount === 1 ? '' : 's'} to review` : 'All caught up'}</div><div class="mt-[1px] text-[12px]" style="color:var(--muted)">{needsCount > 0 ? "A few I flagged or wasn't sure about, tap to take a look" : `Nothing needs your eyes ${day.offset === 0 ? 'today' : 'that day'}`}</div></div>
     <span class="flex-shrink-0 text-[19px]" style="color:var(--faint)">›</span>
   </button>
 {/snippet}
@@ -344,7 +416,10 @@
   <div class="flex items-start justify-between gap-[10px] px-[2px] pt-[8px] pb-[14px]">
     <div>
       <div class="font-head text-[27px] leading-[1.05] font-semibold" style="color:var(--text)">{greeting()}</div>
-      <div class="mt-[3px] text-[13px] font-semibold" style="color:var(--muted)">{longDate()}</div>
+      <!-- The date of the day being READ, not the date it happens to be. The greeting is a
+           hello and stays wall-clock, but this line sat above a navigator saying "Mon, Aug
+           17" and read "Friday, August 21", so the screen carried two dates that disagreed. -->
+      <div class="mt-[3px] text-[13px] font-semibold" style="color:var(--muted)">{longDate(dayDate(day.offset))}</div>
     </div>
     <!-- theme + settings live in the sidebar on desktop, so hide them here -->
     <div class="flex flex-shrink-0 gap-[8px] lg:hidden">
@@ -357,6 +432,9 @@
   <DayNav />
 
   {#if error}<p class="mb-3 text-[13px]" style="color:#e26d5c">{error}</p>{/if}
+
+  <!-- Above the story, in both layouts, because it is a caveat on the story itself. -->
+  {@render catchUpNotice()}
 
   {#if layout.isWide}
     <!-- desktop: a wide story column beside a narrower rail -->

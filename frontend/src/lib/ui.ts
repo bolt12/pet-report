@@ -53,39 +53,40 @@ export function longDate(d = new Date()): string {
   return d.toLocaleDateString(undefined, { weekday: 'long', day: 'numeric', month: 'long' })
 }
 
-// Day navigation: offset 0 = today, 1 = yesterday, ... maps to an ISO date the
-// backend accepts (/api/days/YYYY-MM-DD), and a friendly label.
-export function isoForOffset(offset: number): string {
-  if (offset === 0) return 'today'
+// The calendar date a day-navigator offset lands on. The one place the offset arithmetic
+// lives, so a header naming the day being read and a query asking for it cannot land on
+// different days.
+export function dayDate(offset: number): Date {
   const d = new Date()
   d.setDate(d.getDate() - offset)
-  // Local calendar date, not toISOString, which is UTC and can land a day off near
-  // midnight. The backend windows a day in its own local zone.
+  return d
+}
+
+// Local calendar date, not toISOString, which is UTC and can land a day off near midnight.
+// The backend windows a day in its own local zone.
+function localYmd(d: Date): string {
   const y = d.getFullYear()
   const m = String(d.getMonth() + 1).padStart(2, '0')
   const day = String(d.getDate()).padStart(2, '0')
   return `${y}-${m}-${day}`
+}
+
+// Day navigation: offset 0 = today, 1 = yesterday, ... maps to an ISO date the
+// backend accepts (/api/days/YYYY-MM-DD), and a friendly label.
+export function isoForOffset(offset: number): string {
+  return offset === 0 ? 'today' : ymdForOffset(offset)
 }
 
 // Like isoForOffset but always a concrete 'YYYY-MM-DD' (never 'today'), for date
 // inputs, date-range params, and range labels.
 export function ymdForOffset(offset: number): string {
-  const d = new Date()
-  d.setDate(d.getDate() - offset)
-  const y = d.getFullYear()
-  const m = String(d.getMonth() + 1).padStart(2, '0')
-  const day = String(d.getDate()).padStart(2, '0')
-  return `${y}-${m}-${day}`
+  return localYmd(dayDate(offset))
 }
 
 // Local 'YYYY-MM-DD' of a timestamp (device-local calendar day), for linking a
 // written time to the day its moment actually falls on.
 export function ymdOf(iso: string): string {
-  const d = new Date(iso)
-  const y = d.getFullYear()
-  const m = String(d.getMonth() + 1).padStart(2, '0')
-  const day = String(d.getDate()).padStart(2, '0')
-  return `${y}-${m}-${day}`
+  return localYmd(new Date(iso))
 }
 
 // A friendly short label ("7 Jul") for a 'YYYY-MM-DD' date, parsed as local.
@@ -211,6 +212,13 @@ export function fmtTime(iso: string): string {
   } catch {
     return ''
   }
+}
+
+// A moment's day and clock time together ("Today · 08:14 AM", "Sat, 8 Aug · 3:20 PM"),
+// for a viewer that may show a moment from any day (keepsakes, a pet's history, Ask
+// proof). Reuses dayLabel so a recent day reads relatively and an older one by date.
+export function fmtWhen(iso: string): string {
+  return `${dayLabel(offsetForIso(ymdOf(iso)))} · ${fmtTime(iso)}`
 }
 
 export function relTime(iso: string): string {

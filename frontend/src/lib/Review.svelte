@@ -1,5 +1,20 @@
 <script lang="ts">
-  import { api, petPhotoUrl, type ObsView, type Profile, type ReviewPreset, type MomentsQuery } from './api'
+  import {
+    api,
+    petPhotoUrl,
+    subjectParam,
+    type ActivityValue,
+    type CorrectReq,
+    type BehaviourValue,
+    type MediaValue,
+    type MomentsQuery,
+    type ObsView,
+    type Profile,
+    type ReviewPreset,
+    type SubjectSel,
+    type TimeOfDayValue,
+    type WellbeingValue,
+  } from './api'
   import Thumb from './Thumb.svelte'
   import Avatar from './Avatar.svelte'
   import Paw from './Paw.svelte'
@@ -10,7 +25,7 @@
   import { day } from './day.svelte'
   import { prefs, toggleMomentOrder } from './prefs.svelte'
   import { layout } from './layout.svelte'
-  import { fmtTime, fmtDate, ymdForOffset, friendlyError } from './ui'
+  import { fmtTime, fmtDate, ymdForOffset, offsetForIso, friendlyError, serverMessage, chipStyle } from './ui'
 
   let { profile, preset = {}, onnav }: { profile: Profile; preset?: ReviewPreset; onnav: (s: string) => void } = $props()
 
@@ -22,36 +37,36 @@
   }
   const p0 = readPreset()
 
-  // A deep-link's behaviour tag maps to the closest raw activity the server filters on.
-  const TAG_TO_ACTIVITY: Record<string, string> = {
-    ate: 'eating',
-    drank: 'drinking',
-    rest: 'resting',
-    play: 'playing',
-    groom: 'grooming',
-    toilet: 'eliminating',
-  }
-  const presetAct = p0.act?.[0]
-
-  // Single-select facets (the server browse takes one value per facet).
-  let fPet = $state<string | null>(p0.who?.[0] ?? null)
-  let fAct = $state<string | null>(presetAct ? (TAG_TO_ACTIVITY[presetAct] ?? presetAct) : null)
-  let fRoom = $state<string | null>(p0.room?.[0] ?? null)
-  let fMedia = $state<string | null>(p0.media?.[0] ?? null)
-  let fTime = $state<string | null>(p0.timeOfDay ?? null)
-  let fReview = $state<Review>(p0.needs ? 'needs-look' : (p0.reviewed ?? 'all'))
+  // Single-select facets (the server browse takes one value per facet). Seeded straight
+  // from the preset: it is already a query, so there is no tag-to-facet translation left
+  // to get wrong.
+  // Multi-select, AND-ed by the server: a moment must hold every subject picked. One
+  // chip per pet plus a person and a not-my-pet chip, so "Mochi and a person" is a
+  // question the filter can ask.
+  let fSubjects = $state<SubjectSel[]>(p0.subject ?? [])
+  let fAct = $state<ActivityValue | null>(p0.activity ?? null)
+  let fBeh = $state<BehaviourValue | null>(p0.behaviour ?? null)
+  let fWell = $state<WellbeingValue | null>(p0.wellbeing ?? null)
+  let fRoom = $state<string | null>(p0.room ?? null)
+  let fCams = $state<string[]>(p0.camera ?? [])
+  let fMedia = $state<MediaValue | null>(p0.media ?? null)
+  let fTime = $state<TimeOfDayValue | null>(p0.timeOfDay ?? null)
+  let fReview = $state<Review>(p0.review ?? 'all')
   let searchInput = $state('')
   let search = $state('')
   let filterOpen = $state(false)
 
-  // Range mode (from/to) vs day mode (following the shared day store).
-  // A needs-a-look nudge (no explicit range) opens the GLOBAL backlog over all retained
-  // days (contract D1), matching the Today badge; a deep-link with from/to pins that range.
-  const initRange = p0.from && p0.to
-    ? { from: p0.from, to: p0.to }
-    : p0.needs
-      ? { from: ymdForOffset(day.earliestOffset), to: ymdForOffset(0) }
-      : null
+  // Range mode (from/to) vs day mode (following the shared day store). A deep-link with
+  // from/to pins that range; everything else, a needs-a-look nudge included, follows the
+  // shared day, so the nudge opens the day it was tapped on rather than a global backlog.
+  // The full backlog is still reachable here by pairing the needs-look facet with a range.
+  // A preset naming ONE day is a day, not a range: it moves the shared day navigator and
+  // leaves the screen in day mode. Every in-app nudge builds its query from the day already
+  // in view, so treating those as ranges replaced the navigator with a "Date range · Aug 18"
+  // card and a "Back to daily" button that went precisely nowhere.
+  const oneDay = p0.from && p0.to && p0.from === p0.to ? p0.from : null
+  if (oneDay) day.offset = offsetForIso(oneDay)
+  const initRange = !oneDay && p0.from && p0.to ? { from: p0.from, to: p0.to } : null
   let range = $state<{ from: string; to: string } | null>(initRange)
   let fromDate = $state(initRange?.from ?? '')
   let toDate = $state(initRange?.to ?? '')
@@ -81,9 +96,12 @@
     return {
       from: range?.from ?? day.iso,
       to: range?.to ?? day.iso,
-      pet: fPet ?? undefined,
+      subject: fSubjects.length ? fSubjects : undefined,
       activity: fAct ?? undefined,
+      behaviour: fBeh ?? undefined,
+      wellbeing: fWell ?? undefined,
       room: fRoom ?? undefined,
+      camera: fCams.length ? fCams : undefined,
       media: fMedia ?? undefined,
       timeOfDay: fTime ?? undefined,
       review: fReview === 'all' ? undefined : fReview,
@@ -124,9 +142,12 @@
   $effect(() => {
     range
     if (!range) day.offset
-    fPet
+    fSubjects
     fAct
+    fBeh
+    fWell
     fRoom
+    fCams
     fMedia
     fTime
     fReview
@@ -153,7 +174,7 @@
 
   // Facet options. Rooms come from the profile's camera map (no full-set fetch needed);
   // activities are the meaningful subset of what the model reports.
-  const ACTIVITIES = [
+  const ACTIVITIES: { key: ActivityValue; label: string }[] = [
     { key: 'eating', label: 'Eating' },
     { key: 'drinking', label: 'Drinking' },
     { key: 'sleeping', label: 'Sleeping' },
@@ -164,37 +185,85 @@
     { key: 'walking', label: 'Walking' },
     { key: 'alert', label: 'Alert' },
   ]
-  const MEDIA = [
+  // The behaviour facet, matching the columns the per-pet tiles count. A tile links on
+  // the same word it counted, so its number and its list are the same set.
+  const BEHAVIOURS: { key: BehaviourValue; label: string }[] = [
+    { key: 'ate', label: 'Ate' },
+    { key: 'drank', label: 'Drank' },
+    { key: 'slept', label: 'Slept' },
+    { key: 'played', label: 'Played' },
+    { key: 'groomed', label: 'Groomed' },
+    { key: 'eliminated', label: 'Litter' },
+    { key: 'rest', label: 'Resting' },
+    { key: 'active', label: 'Active' },
+    { key: 'concern', label: 'Health signal' },
+  ]
+  const MEDIA: { key: MediaValue; label: string }[] = [
     { key: 'photo', label: 'Photo' },
     { key: 'clip', label: 'Clip' },
     { key: 'audio', label: 'Audio' },
   ]
-  const TIMES = [
+  const TIMES: { key: TimeOfDayValue; label: string }[] = [
     { key: 'morning', label: 'Morning' },
     { key: 'afternoon', label: 'Afternoon' },
     { key: 'evening', label: 'Evening' },
     { key: 'night', label: 'Night' },
   ]
   let rooms = $derived([...new Set(profile.cameras.map((c) => c.room))])
+  // Species the loaded page holds that are nobody's pet: a neighbour's rabbit, a fox at the
+  // door. Without these the Who row could not ask for a moment whose own card says "Rabbit",
+  // so it was the one subject on screen no filter could reach.
+  let otherSpecies = $derived(
+    [
+      ...new Set(
+        items
+          .flatMap((o) => o.subjects)
+          .filter((s) => !s.person && !s.petId && s.species && !profile.pets.some((p) => p.petSpecies === s.species))
+          .map((s) => s.species as string),
+      ),
+    ].sort(),
+  )
   const petName = (id: string) => profile.pets.find((p) => p.petId === id)?.petName ?? id
-  const actLabel = (k: string) => ACTIVITIES.find((a) => a.key === k)?.label ?? k
-  const mediaLabel = (k: string) => MEDIA.find((m) => m.key === k)?.label ?? k
-  const timeLabel = (k: string) => TIMES.find((t) => t.key === k)?.label ?? k
+  // Subjects are compared by their wire rendering, which is the one place a selector's
+  // identity is already defined.
+  const sameSubject = (a: SubjectSel, b: SubjectSel) => subjectParam(a) === subjectParam(b)
+  const hasSubject = (s: SubjectSel) => fSubjects.some((x) => sameSubject(x, s))
+  function toggleSubject(s: SubjectSel) {
+    fSubjects = hasSubject(s) ? fSubjects.filter((x) => !sameSubject(x, s)) : [...fSubjects, s]
+  }
+  const subjectLabel = (s: SubjectSel) =>
+    s.kind === 'pet'
+      ? petName(s.petId)
+      : s.kind === 'species'
+        ? s.species
+        : s.kind === 'person'
+          ? 'A person'
+          : 'Not my pet'
+  const behLabel = (k: BehaviourValue) => BEHAVIOURS.find((b) => b.key === k)?.label ?? k
+  const actLabel = (k: ActivityValue) => ACTIVITIES.find((a) => a.key === k)?.label ?? k
+  const mediaLabel = (k: MediaValue) => MEDIA.find((m) => m.key === k)?.label ?? k
+  const timeLabel = (k: TimeOfDayValue) => TIMES.find((t) => t.key === k)?.label ?? k
   const reviewLabel = (r: Review) =>
     r === 'reviewed' ? 'Reviewed' : r === 'unreviewed' ? 'Not reviewed' : r === 'needs-look' ? 'Needs a look' : ''
 
   let filterCount = $derived(
-    (fPet ? 1 : 0) +
+    fSubjects.length +
       (fAct ? 1 : 0) +
+      (fBeh ? 1 : 0) +
+      (fWell ? 1 : 0) +
       (fRoom ? 1 : 0) +
+      (fCams.length ? 1 : 0) +
       (fMedia ? 1 : 0) +
       (fTime ? 1 : 0) +
       (fReview !== 'all' ? 1 : 0),
   )
   function clearAll() {
-    fPet = null
+    fSubjects = []
     fAct = null
+    fBeh = null
+    fWell = null
     fRoom = null
+    fCams = []
     fMedia = null
     fTime = null
     fReview = 'all'
@@ -206,9 +275,12 @@
 
   let activeChips = $derived([
     ...(fReview !== 'all' ? [{ label: reviewLabel(fReview), remove: () => (fReview = 'all') }] : []),
-    ...(fPet ? [{ label: petName(fPet), remove: () => (fPet = null) }] : []),
+    ...fSubjects.map((s) => ({ label: subjectLabel(s), remove: () => toggleSubject(s) })),
     ...(fAct ? [{ label: actLabel(fAct), remove: () => (fAct = null) }] : []),
+    ...(fBeh ? [{ label: behLabel(fBeh), remove: () => (fBeh = null) }] : []),
+    ...(fWell ? [{ label: 'Concerning', remove: () => (fWell = null) }] : []),
     ...(fRoom ? [{ label: fRoom, remove: () => (fRoom = null) }] : []),
+    ...(fCams.length ? [{ label: 'Selected cameras', remove: () => (fCams = []) }] : []),
     ...(fMedia ? [{ label: mediaLabel(fMedia), remove: () => (fMedia = null) }] : []),
     ...(fTime ? [{ label: timeLabel(fTime), remove: () => (fTime = null) }] : []),
   ])
@@ -220,32 +292,71 @@
   function mark(id: number) {
     reviewedIds = new Set(reviewedIds).add(id)
   }
-  const thatsRight = async (o: ObsView) => {
-    await api.review([o.id])
-    mark(o.id)
+
+  // Every card action goes through here, for the two things none of them had: a report when
+  // the server says no, and a guard against firing twice. Without it a failure was an
+  // unhandled rejection and the tap simply did nothing, which is what a moment with no
+  // sightings did to "Not that one" every single time.
+  let acting = $state(false)
+  let actionError = $state('')
+  async function act(fn: () => Promise<unknown>) {
+    if (acting) return
+    acting = true
+    actionError = ''
+    try {
+      await fn()
+    } catch (e) {
+      // The server's own words, when it has any. Every owner-facing 400 this app writes
+      // ("This moment already holds 16 subjects...", "invalid cursor") was being replaced
+      // here with "The server hit a problem (400)", which tells nobody anything.
+      actionError = serverMessage(e)
+    } finally {
+      acting = false
+    }
   }
-  const reviewAllShown = async () => {
-    const ids = shownNeeds.map((o) => o.id)
-    if (!ids.length) return
-    await api.review(ids)
-    reviewedIds = new Set([...reviewedIds, ...ids])
+
+  const thatsRight = (o: ObsView) =>
+    act(async () => {
+      await api.review([o.id])
+      mark(o.id)
+    })
+  const reviewAllShown = () =>
+    act(async () => {
+      const ids = shownNeeds.map((o) => o.id)
+      if (!ids.length) return
+      await api.review(ids)
+      reviewedIds = new Set([...reviewedIds, ...ids])
+    })
+  // Which sighting the inline reassign panel is naming. Keyed by moment, so opening the
+  // panel on one card does not carry a selection over from another.
+  let reassignIx = $state(0)
+  const openReassign = (o: ObsView) => {
+    reassignId = o.id
+    reassignIx = o.subjects.find((s) => !s.person)?.ix ?? o.subjects[0]?.ix ?? 0
   }
-  const reassign = async (o: ObsView, target: { petId?: string; person?: boolean; visiting?: boolean }) => {
-    await api.correct(o.id, target)
-    mark(o.id)
-    reassignId = null
-  }
-  const del = async (o: ObsView) => {
-    await api.del(o.id)
-    confirmDelId = null
-    reload()
-  }
-  // Undo a review/correction: revert the moment to the model's original reading so it
-  // comes back for a fresh look.
-  const unreview = async (o: ObsView) => {
-    await api.revert(o.id)
-    reviewedIds = new Set([...reviewedIds].filter((x) => x !== o.id))
-  }
+  // Naming a subject changes the reading; it is not the owner saying the whole moment is
+  // right, so the card keeps its "That's right" and simply shows the new name. Only the one
+  // moment is re-read, so the list does not jump under a finger that is still working.
+  const reassign = (o: ObsView, target: CorrectReq) =>
+    act(async () => {
+      await api.correct(o.id, reassignIx, target)
+      const updated = await api.moment(o.id)
+      items = items.map((x) => (x.id === o.id ? updated : x))
+      reassignId = null
+    })
+  const del = (o: ObsView) =>
+    act(async () => {
+      await api.del(o.id)
+      confirmDelId = null
+      reload()
+    })
+  // Take back the review, keeping any correction that came with it. The wider undo, back to
+  // the model's own reading, lives in the moment viewer where the corrections are visible.
+  const unreview = (o: ObsView) =>
+    act(async () => {
+      await api.unreview(o.id)
+      reviewedIds = new Set([...reviewedIds].filter((x) => x !== o.id))
+    })
   function open(o: ObsView) {
     openLightbox(ordered, o.id, profile.pets, reload)
   }
@@ -273,7 +384,7 @@
 
 {#snippet markAll()}
   {#if shownNeeds.length > 1}
-    <button onclick={reviewAllShown} class="mb-[12px] w-full rounded-[14px] py-[11px] text-[13px] font-extrabold" style="background:rgba(163,192,143,0.16);color:var(--good);border:none">Mark all {shownNeeds.length} shown as right</button>
+    <button onclick={reviewAllShown} disabled={acting} class="mb-[12px] w-full rounded-[14px] py-[11px] text-[13px] font-extrabold disabled:opacity-50" style="background:rgba(163,192,143,0.16);color:var(--good);border:none">Mark all {shownNeeds.length} shown as right</button>
   {/if}
 {/snippet}
 
@@ -312,7 +423,14 @@
       <div class="mb-[9px] text-[11px] font-extrabold tracking-wide uppercase" style="color:var(--faint)">Who</div>
       <div class="flex flex-wrap gap-[7px]">
         {#each profile.pets as p (p.petId)}
-          <button onclick={() => (fPet = fPet === p.petId ? null : p.petId)} class="rounded-full px-[10px] py-[4px] text-[11.5px] font-bold" style={optStyle(fPet === p.petId)}>{p.petName}</button>
+          <button onclick={() => toggleSubject({ kind: 'pet', petId: p.petId })} class="rounded-full px-[10px] py-[4px] text-[11.5px] font-bold" style={optStyle(hasSubject({ kind: 'pet', petId: p.petId }))}>{p.petName}</button>
+        {/each}
+        <!-- The two subjects the facet vocabulary could not express before, so the day
+             summary had to fake one of them as a pet id. -->
+        <button onclick={() => toggleSubject({ kind: 'person' })} class="rounded-full px-[10px] py-[4px] text-[11.5px] font-bold" style={optStyle(hasSubject({ kind: 'person' }))}>A person</button>
+        <button onclick={() => toggleSubject({ kind: 'visiting' })} class="rounded-full px-[10px] py-[4px] text-[11.5px] font-bold" style={optStyle(hasSubject({ kind: 'visiting' }))}>Not my pet</button>
+        {#each otherSpecies as sp (sp)}
+          <button onclick={() => toggleSubject({ kind: 'species', species: sp })} class="rounded-full px-[10px] py-[4px] text-[11.5px] font-bold capitalize" style={optStyle(hasSubject({ kind: 'species', species: sp }))}>{sp}</button>
         {/each}
       </div>
     </div>
@@ -368,6 +486,14 @@
 
 {#snippet resultsBody()}
   {#if error}<p class="mb-3 text-[13px]" style="color:#e26d5c">{error}</p>{/if}
+  <!-- A failed card action. Separate from the load error above, which describes the list
+       rather than the tap, and dismissible because the card it refers to is still there. -->
+  {#if actionError}
+    <div class="mb-3 flex items-start gap-[10px] rounded-[14px] px-[13px] py-[10px]" style="background:rgba(226,109,92,0.12);border:1px solid rgba(226,109,92,0.3)">
+      <span class="min-w-0 flex-1 text-[12.5px] leading-[1.45]" style="color:#e26d5c">{actionError}</span>
+      <button onclick={() => (actionError = '')} class="flex-shrink-0 text-[12px] font-bold" style="border:none;background:none;color:#e26d5c">Dismiss</button>
+    </div>
+  {/if}
 
   <!-- list -->
   {#if loading}
@@ -392,7 +518,7 @@
             </div>
             <div class="flex min-w-0 flex-1 flex-col gap-[4px]">
               <div class="flex items-center gap-[6px]"><WellbeingDot wellbeing={o.wellbeing} /><span class="text-[11.5px] font-extrabold" style="color:var(--text)">{fmtTime(o.at)}</span><span style="color:var(--faint)">·</span><span class="text-[11.5px] font-semibold" style="color:var(--muted)">{o.room}</span></div>
-              <div class="flex flex-wrap items-center gap-[7px]"><span class="font-head text-[15px] font-semibold" style="color:var(--text)">{o.subjectLabel}</span>{#if o.uncertain}<span class="rounded-full px-[8px] py-[2px] text-[10px] font-bold whitespace-nowrap" style="color:var(--unclear);background:rgba(183,168,192,0.14)">not fully sure</span>{/if}{#if o.reviewed && !reviewedIds.has(o.id)}<span class="rounded-full px-[8px] py-[2px] text-[10px] font-bold whitespace-nowrap" style="color:var(--good);background:rgba(163,192,143,0.16)">✓ reviewed</span>{/if}</div>
+              <div class="flex flex-wrap items-center gap-[7px]"><span class="font-head text-[15px] font-semibold" style="color:var(--text)">{o.subjectLabel}</span>{#if o.uncertain}<span class="rounded-full px-[8px] py-[2px] text-[10px] font-bold whitespace-nowrap" style="color:var(--unclear);background:rgba(183,168,192,0.14)">not fully sure</span>{/if}{#if o.subjects.some((s) => s.byModel)}<span class="rounded-full px-[8px] py-[2px] text-[10px] font-bold whitespace-nowrap" style={chipStyle('info')} title="I picked this pet myself. Open it to confirm or change.">my guess</span>{/if}{#if o.reviewed && !reviewedIds.has(o.id)}<span class="rounded-full px-[8px] py-[2px] text-[10px] font-bold whitespace-nowrap" style="color:var(--good);background:rgba(163,192,143,0.16)">✓ reviewed</span>{/if}</div>
               {#if o.description}<div class="clamp2 text-[12px] leading-[1.35]" style="color:var(--muted)">{o.description}</div>{/if}
             </div>
           </button>
@@ -403,21 +529,30 @@
                   <span class="text-[11.5px] font-extrabold" style="color:var(--text)">Who was it, really?</span>
                   <button onclick={() => (reassignId = null)} class="bg-transparent text-[12px] font-bold" style="border:none;color:var(--faint)">Cancel</button>
                 </div>
+                {#if o.subjects.length > 1}
+                  <!-- Pick the subject first: this frame holds more than one, and each
+                       carries its own identity. -->
+                  <div class="mb-[9px] flex flex-wrap gap-[6px]">
+                    {#each o.subjects as s (s.ix)}
+                      <button onclick={() => (reassignIx = s.ix)} class="rounded-full px-[10px] py-[4px] text-[11.5px] font-bold" style={optStyle(reassignIx === s.ix)}>{s.label}</button>
+                    {/each}
+                  </div>
+                {/if}
                 <div class="flex flex-col gap-[6px]">
                   {#each profile.pets as p (p.petId)}
-                    <button onclick={() => reassign(o, { petId: p.petId })} class="flex w-full items-center gap-[9px] rounded-xl border p-[7px_9px] text-left" style="background:var(--surface2);border-color:var(--line);color:inherit">
+                    <button onclick={() => reassign(o, { kind: 'pet', petId: p.petId })} disabled={acting} class="flex w-full items-center gap-[9px] rounded-xl border p-[7px_9px] text-left" style="background:var(--surface2);border-color:var(--line);color:inherit">
                       <Avatar name={p.petName} species={p.petSpecies} size={30} photo={petPhotoUrl(p.petId, p.petPhoto)} />
                       <span class="font-head text-[13.5px] font-semibold" style="color:var(--text)">{p.petName}</span>
                       <span class="text-[11px] capitalize" style="color:var(--muted)">{p.petSpecies}</span>
                     </button>
                   {/each}
-                  <button onclick={() => reassign(o, { visiting: true })} class="flex w-full items-center gap-[9px] rounded-xl border p-[7px_9px] text-left" style="background:var(--surface2);border-color:var(--line);color:inherit">
+                  <button onclick={() => reassign(o, { kind: 'visiting' })} disabled={acting} class="flex w-full items-center gap-[9px] rounded-xl border p-[7px_9px] text-left" style="background:var(--surface2);border-color:var(--line);color:inherit">
                     <span class="flex h-[30px] w-[30px] items-center justify-center rounded-full font-head text-[13px] font-semibold" style="background:var(--surface);border:1px solid var(--line);color:var(--muted)">?</span>
-                    <div class="min-w-0"><div class="font-head text-[13.5px] font-semibold" style="color:var(--text)">A visitor</div><div class="text-[10.5px]" style="color:var(--faint)">Not one of my pets</div></div>
+                    <div class="min-w-0"><div class="font-head text-[13.5px] font-semibold" style="color:var(--text)">Not my pet</div><div class="text-[10.5px]" style="color:var(--faint)">An animal, but not one of mine</div></div>
                   </button>
-                  <button onclick={() => reassign(o, { person: true })} class="flex w-full items-center gap-[9px] rounded-xl border p-[7px_9px] text-left" style="background:var(--surface2);border-color:var(--line);color:inherit">
+                  <button onclick={() => reassign(o, { kind: 'person' })} disabled={acting} class="flex w-full items-center gap-[9px] rounded-xl border p-[7px_9px] text-left" style="background:var(--surface2);border-color:var(--line);color:inherit">
                     <span class="flex h-[30px] w-[30px] items-center justify-center rounded-full text-[15px]" style="background:var(--surface);border:1px solid var(--line);color:var(--muted)">☺</span>
-                    <div class="min-w-0"><div class="font-head text-[13.5px] font-semibold" style="color:var(--text)">A person</div><div class="text-[10.5px]" style="color:var(--faint)">It was a human, not an animal</div></div>
+                    <div class="min-w-0"><div class="font-head text-[13.5px] font-semibold" style="color:var(--text)">A person</div><div class="text-[10.5px]" style="color:var(--faint)">A human, not an animal</div></div>
                   </button>
                 </div>
               </div>
@@ -426,10 +561,15 @@
                 <div class="mt-[10px] text-[11.5px] leading-[1.4]" style="color:#e26d5c">Deletes this moment for good, plus any keepsake of it and its saved image.</div>
               {/if}
               <div class="mt-[11px] flex gap-[7px] border-t pt-[11px]" style="border-color:var(--line)">
-                <button onclick={() => thatsRight(o)} class="flex-1 rounded-xl py-[8px] text-[12px] font-extrabold" style="border:none;background:rgba(163,192,143,0.16);color:var(--good)">That's right</button>
-                <button onclick={() => (reassignId = o.id)} class="flex-1 rounded-xl py-[8px] text-[12px] font-bold" style="border:none;background:var(--surface2);color:var(--text)">Not that one</button>
+                <button onclick={() => thatsRight(o)} disabled={acting} class="flex-1 rounded-xl py-[8px] text-[12px] font-extrabold disabled:opacity-50" style="border:none;background:rgba(163,192,143,0.16);color:var(--good)">That's right</button>
+                <!-- Only where there is a subject to rename. A sound has none, and neither
+                     has a frame the model read as empty, so the panel this opened could
+                     only ever address a sighting that is not there. -->
+                {#if o.subjects.length}
+                  <button onclick={() => openReassign(o)} disabled={acting} class="flex-1 rounded-xl py-[8px] text-[12px] font-bold disabled:opacity-50" style="border:none;background:var(--surface2);color:var(--text)">Not that one</button>
+                {/if}
                 {#if confirmDelId === o.id}
-                  <button onclick={() => del(o)} class="flex-shrink-0 rounded-xl px-[12px] py-[8px] text-[12px] font-extrabold" style="border:none;background:rgba(226,109,92,0.18);color:#e26d5c">Sure?</button>
+                  <button onclick={() => del(o)} disabled={acting} class="flex-shrink-0 rounded-xl px-[12px] py-[8px] text-[12px] font-extrabold disabled:opacity-50" style="border:none;background:rgba(226,109,92,0.18);color:#e26d5c">Sure?</button>
                 {:else}
                   <button onclick={() => (confirmDelId = o.id)} class="flex-shrink-0 rounded-xl px-[12px] py-[8px] text-[12px] font-bold" style="border:none;background:var(--surface2);color:var(--faint)">Delete</button>
                 {/if}
@@ -438,7 +578,7 @@
           {:else if reviewedIds.has(o.id)}
             <div class="mt-[10px] flex items-center justify-between gap-[8px] border-t pt-[10px]" style="border-color:var(--line)">
               <span class="flex items-center gap-[6px] text-[12px] font-bold" style="color:var(--good)"><span>✓</span> Marked. I'll remember that.</span>
-              <button onclick={() => unreview(o)} class="flex-shrink-0 rounded-lg px-[12px] py-[6px] text-[11.5px] font-extrabold" style="border:none;background:var(--surface2);color:var(--muted)">Undo</button>
+              <button onclick={() => unreview(o)} disabled={acting} class="flex-shrink-0 rounded-lg px-[12px] py-[6px] text-[11.5px] font-extrabold disabled:opacity-50" style="border:none;background:var(--surface2);color:var(--muted)">Not checked after all</button>
             </div>
           {/if}
         </div>
