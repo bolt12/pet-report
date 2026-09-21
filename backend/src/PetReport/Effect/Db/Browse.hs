@@ -141,8 +141,8 @@ data Cursor = Cursor
   deriving stock (Eq, Show)
 
 -- | A browse request. Every facet is optional. @from@ and @to@ bound a half-open time
--- window, @cameras@ is a room resolved to its cameras, @pet@ is pre-resolved above,
--- @cursor@ pages, @sort@ orders, and @limit@ is the page size.
+-- window, @subjects@ is zero or more subject filters AND-ed together, @cursor@ pages,
+-- @sort@ orders, and @limit@ is the page size.
 --
 -- @timeOfDay@ carries its tz offset in seconds, making the predicate a pure server-side
 -- filter. That fixed offset is an approximation: it lands an hour out only at a DST

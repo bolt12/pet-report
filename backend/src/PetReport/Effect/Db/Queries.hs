@@ -189,12 +189,24 @@ reprojectAll h = withConn h $ \c -> withImmediateTransaction c $ do
 -- from there.
 repairNamedSpecies :: Handle -> Roster -> IO Int
 repairNamedSpecies _ [] = pure 0
-repairNamedSpecies h roster = withConn h $ \c -> withImmediateTransaction c $ do
-  rows <-
-    query_ c "SELECT id, perception, raw_perception FROM observations" ::
-      IO [(Int64, Text, Maybe Text)]
-  sum <$> mapM (repairRow c) rows
+repairNamedSpecies h roster = withConn h $ \c -> go c 0 0
   where
+    pageSize = 500 :: Int
+
+    go c lastId !total = do
+      rows <-
+        query c
+          "SELECT id, perception, raw_perception FROM observations \
+          \WHERE id > ? ORDER BY id LIMIT ?"
+          (lastId, pageSize) ::
+          IO [(Int64, Text, Maybe Text)]
+      case rows of
+        [] -> pure total
+        _  -> do
+          n <- withImmediateTransaction c $ sum <$> mapM (repairRow c) rows
+          let (nextId, _, _) = last rows
+          go c nextId (total + n)
+
     repairRow c (oid, perc, mraw) = case decodePerception perc of
       Left _ -> pure 0
       Right p -> do
@@ -336,17 +348,6 @@ insertObservation h roster obs = withConn h $ \c -> withImmediateTransaction c $
     writeFacts c oid (noPerception obs)
     writeModelIdentities Replace c roster oid (noPerception obs)
 
--- | Record which household pet the model said each subject was, resolved against the roster.
---
--- This is the answer to "which of my two dogs is that", and the only one available: species
--- alone cannot separate them, and the owner naming every sighting by hand is the work the
--- feature exists to avoid. The claim lives in the same table an owner correction does, so
--- one resolution path serves both, and a later correction simply overwrites the row.
---
--- @confirmed@ carries the confidence verdict rather than a threshold in SQL: a naming the
--- model was sure of counts everywhere immediately, and an unsure one counts nowhere but is
--- kept, because the moment is already in the review backlog and the guess is what makes
--- settling it one tap. A name no pet answers to is dropped.
 -- | What an insert does about a row that is already there. A closed pair rather than the SQL
 -- word itself, so the statement is still built from this module's own vocabulary and never
 -- from a fragment handed in by a caller.
@@ -363,6 +364,17 @@ conflictSql :: OnConflict -> Query
 conflictSql Replace = "REPLACE"
 conflictSql Ignore  = "IGNORE"
 
+-- | Record which household pet the model said each subject was, resolved against the roster.
+--
+-- This is the answer to "which of my two dogs is that", and the only one available: species
+-- alone cannot separate them, and the owner naming every sighting by hand is the work the
+-- feature exists to avoid. The claim lives in the same table an owner correction does, so
+-- one resolution path serves both, and a later correction simply overwrites the row.
+--
+-- @confirmed@ carries the confidence verdict rather than a threshold in SQL: a naming the
+-- model was sure of counts everywhere immediately, and an unsure one counts nowhere but is
+-- kept, because the moment is already in the review backlog and the guess is what makes
+-- settling it one tap. A name no pet answers to is dropped.
 writeModelIdentities :: OnConflict -> Connection -> Roster -> Int64 -> Perception -> IO ()
 writeModelIdentities conflict c roster oid p = do
   now <- getCurrentTime
@@ -815,30 +827,27 @@ updateObservationPerceptionIf ::
   Handle -> Settle -> Int64 -> (Perception -> Bool) -> (Perception -> Perception) -> IO Bool
 updateObservationPerceptionIf h settle oid ok f = do
   now <- getCurrentTime
-  -- Read and write on one connection inside a transaction, so two overlapping corrections
-  -- serialize instead of losing an update, and the UPDATE and re-projection commit
-  -- together rather than being seen half-applied.
-  withConn h $ \c -> withImmediateTransaction c $ do
-    m <- getObservationC c oid
-    case m of
-      Nothing -> pure False
-      Just obs | not (ok (perception obs)) -> pure False
-      Just obs -> do
-        let p' = f (perception obs)
-        execute
-          c
-          "UPDATE observations SET perception = ?, confidence = ?, needs_look = ? WHERE id = ?"
-          (TL.toStrict (encodeToLazyText p'), confidenceOf p', boolToInt (needsLook p'), oid)
-        -- The verdict is its own statement, in the same transaction, and character for
-        -- character the one 'markReviewed' runs. Splicing it into the UPDATE above meant
-        -- hand-building the parameter list, which is the one place in this module where a
-        -- placeholder and its argument could drift apart in silence.
-        when (settle == Confirm) $
-          execute c "UPDATE observations SET reviewed = 1, reviewed_at = ? WHERE id = ?" (posixOf now, oid)
-        -- Re-project the facts. raw_perception stays untouched, so the model's original
-        -- reading survives the correction as an audit trail.
-        writeFacts c oid p'
-        pure True
+  withConn h $ \c -> withImmediateTransaction c $ updatePerceptionC now c settle oid ok f
+
+-- | The transaction body shared by 'updateObservationPerceptionIf' (standalone) and
+-- 'correctObservation' (composed with an override write in the same transaction).
+updatePerceptionC ::
+  UTCTime -> Connection -> Settle -> Int64 -> (Perception -> Bool) -> (Perception -> Perception) -> IO Bool
+updatePerceptionC now c settle oid ok f = do
+  m <- getObservationC c oid
+  case m of
+    Nothing -> pure False
+    Just obs | not (ok (perception obs)) -> pure False
+    Just obs -> do
+      let p' = f (perception obs)
+      execute
+        c
+        "UPDATE observations SET perception = ?, confidence = ?, needs_look = ? WHERE id = ?"
+        (TL.toStrict (encodeToLazyText p'), confidenceOf p', boolToInt (needsLook p'), oid)
+      when (settle == Confirm) $
+        execute c "UPDATE observations SET reviewed = 1, reviewed_at = ? WHERE id = ?" (posixOf now, oid)
+      writeFacts c oid p'
+      pure True
 
 -- | Apply an owner correction to ONE sighting. A species or person target rewrites that
 -- sighting inside the perception blob. A specific-pet or visiting target is an /individual/
@@ -852,18 +861,22 @@ updateObservationPerceptionIf h settle oid ok f = do
 -- moment, so correcting the cat also relabelled the dog beside it.
 correctObservation :: Handle -> Int64 -> Int -> Correction -> IO Bool
 correctObservation h oid ix corr = case corr of
-  -- Settle the species in the blob FIRST, then write the identity. The order matters twice
-  -- over: 'writeOverride' refuses a person sighting, so a mis-read person could not be
-  -- named at all until the reading was fixed; and leaving a mis-detected species behind
-  -- meant the projection still said "dog" for a sighting the owner had called a cat, so a
-  -- species filter missed a moment the pet filter returned.
+  -- The blob rewrite and the identity override commit together, so a crash or error between
+  -- them cannot leave a species-corrected sighting without its pet attribution.
   ToPet pid _ -> do
-    okBlob <- updateSighting h LeaveOpen oid ix (applyCorrectionAt ix corr)
-    if okBlob then writeOverride h oid ix (IdPet pid) else pure False
+    now <- getCurrentTime
+    withConn h $ \c -> withImmediateTransaction c $ do
+      ok <- updatePerceptionC now c LeaveOpen oid (hasSightingAt ix) (applyCorrectionAt ix corr)
+      if ok then writeOverrideC now c oid ix (IdPet pid) else pure False
   ToVisiting -> writeOverride h oid ix IdVisiting
   ToSpecies _ -> updateSighting h LeaveOpen oid ix (applyCorrectionAt ix corr)
-  ToPerson ->
-    clearOverrideAt h oid ix *> updateSighting h LeaveOpen oid ix (applyCorrectionAt ix corr)
+  -- The override deletion and the blob rewrite commit together, so a person correction
+  -- cannot lose the override without also settling the species.
+  ToPerson -> do
+    now <- getCurrentTime
+    withConn h $ \c -> withImmediateTransaction c $ do
+      execute c "DELETE FROM subject_identity WHERE obs_id = ? AND seq = ?" (oid, ix)
+      updatePerceptionC now c LeaveOpen oid (hasSightingAt ix) (applyCorrectionAt ix corr)
 
 -- | Rewrite a perception through @f@, but only when the addressed sighting exists. Keeps
 -- the range check and the write in one transaction, so a concurrent edit cannot shrink the
@@ -884,20 +897,23 @@ updateSighting h settle oid ix = updateObservationPerceptionIf h settle oid (has
 writeOverride :: Handle -> Int64 -> Int -> SubjectId -> IO Bool
 writeOverride h oid ix sid = do
   now <- getCurrentTime
-  withConn h $ \c -> withImmediateTransaction c $ do
-    m <- getObservationC c oid
-    case m of
-      Nothing -> pure False
-      Just obs -> case drop ix (factsOf (perception obs)) of
-        (f : _) | ix >= 0 && not (sfIsPerson f) -> do
-          execute
-            c
-            "INSERT OR REPLACE INTO subject_identity \
-            \(obs_id, seq, pet_id, visiting, source, confirmed, ts) \
-            \VALUES (?, ?, ?, ?, 'owner', 1, ?)"
-            (oid, ix, petIdOf sid, visitingOf sid, posixOf now)
-          pure True
-        _ -> pure False
+  withConn h $ \c -> withImmediateTransaction c $ writeOverrideC now c oid ix sid
+
+writeOverrideC :: UTCTime -> Connection -> Int64 -> Int -> SubjectId -> IO Bool
+writeOverrideC now c oid ix sid = do
+  m <- getObservationC c oid
+  case m of
+    Nothing -> pure False
+    Just obs -> case drop ix (factsOf (perception obs)) of
+      (f : _) | ix >= 0 && not (sfIsPerson f) -> do
+        execute
+          c
+          "INSERT OR REPLACE INTO subject_identity \
+          \(obs_id, seq, pet_id, visiting, source, confirmed, ts) \
+          \VALUES (?, ?, ?, ?, 'owner', 1, ?)"
+          (oid, ix, petIdOf sid, visitingOf sid, posixOf now)
+        pure True
+      _ -> pure False
   where
     petIdOf (IdPet pid) = Just (petIdText pid)
     petIdOf IdVisiting  = Nothing
@@ -964,12 +980,6 @@ isScene :: Perception -> Bool
 isScene p = case p of
   Seen _  -> True
   Heard _ -> False
-
--- | Drop the identity override on one sighting, leaving its neighbours in the same moment
--- alone.
-clearOverrideAt :: Handle -> Int64 -> Int -> IO ()
-clearOverrideAt h oid ix = withConn h $ \c ->
-  execute c "DELETE FROM subject_identity WHERE obs_id = ? AND seq = ?" (oid, ix)
 
 -- | Take back the owner's verdict, leaving everything they said about the moment in place:
 -- the reading they edited, and every identity they named. The moment returns to the backlog

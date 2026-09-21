@@ -782,7 +782,7 @@ viewUnits =
       -- The label falls back to a title-cased camera id, and the camera it came from is
       -- carried alongside so a link can filter on something that actually exists.
       roomDistribution [] mempty roster (PetId "dexter") [obs1, obs1]
-        @?= [("Office", ["office"], 2)]
+        @?= [("Office", [Camera "office"], 2)]
   , testCase "petStatOver is monotone over nested windows (day <= week <= month)" $ do
       -- One sighting today, one 2 days ago, one 9 days ago: the 1/7/30-day windows
       -- must count 1/2/3, so day <= week <= month holds by construction.

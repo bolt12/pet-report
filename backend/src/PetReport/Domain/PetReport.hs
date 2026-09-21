@@ -54,8 +54,8 @@ import           PetReport.Domain.Stats       (resolvedStatsMap, StoredStats (..
                                                emptyPetStat, statOf,
                                                subjectAppearances)
 import           PetReport.Domain.Trends      (DayTrend (..), trends)
-import           PetReport.Domain.Types       (ObsId (..), PetId, activityText,
-                                               cameraText, petIdText,
+import           PetReport.Domain.Types       (Camera (..), ObsId (..), PetId,
+                                               activityText, petIdText,
                                                speciesText)
 import           PetReport.Domain.View        (Chip (..), ChipKind (..))
 import           PetReport.Util               (capitalize, prefixed, tshow)
@@ -102,7 +102,7 @@ instance ToJSON Habit where
 -- number and the list agree whatever the label says.
 data Spot = Spot
   { spRoom    :: Text
-  , spCameras :: [Text]
+  , spCameras :: [Camera]
   , spPct     :: Int
   }
   deriving stock (Eq, Show, Generic)
@@ -438,7 +438,7 @@ mealMarks tz ov key roster obss =
 -- the cameras that merged are returned alongside. Those ids are the only part of this that
 -- a query can filter on; see 'Spot'.
 roomDistribution ::
-  [CameraRoom] -> Overrides -> Roster -> PetId -> [Observation] -> [(Text, [Text], Int)]
+  [CameraRoom] -> Overrides -> Roster -> PetId -> [Observation] -> [(Text, [Camera], Int)]
 roomDistribution crs ov roster pid obss =
   [ (lbl, Set.toList cams, n)
   | (lbl, (cams, n)) <- sortOn (Down . snd . snd) (Map.toList grouped)
@@ -446,8 +446,8 @@ roomDistribution crs ov roster pid obss =
   where
     grouped =
       Map.fromListWith
-        (\(c1, n1) (c2, n2) -> (Set.union c1 c2, n1 + n2))
-        [ (roomOf crs (camera o), (Set.singleton (cameraText (camera o)), 1 :: Int))
+        (\(c1, n1) (c2, n2) -> let !n = n1 + n2 in (Set.union c1 c2, n))
+        [ (roomOf crs (camera o), (Set.singleton (camera o), 1 :: Int))
         | o <- obss
         , _ <- subjectAppearances ov roster (KPet pid) o
         ]
