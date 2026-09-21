@@ -256,7 +256,7 @@ statsHandler app args = do
                    , "played" .= Stats.psPlayed v
                    , "concerns" .= Stats.psConcerns v
                    ]
-               | (k, v) <- Map.toList pres
+               | (k, v) <- Map.toList (Stats.resolvedStatsMap pres)
                ]
         ]
     , []

@@ -94,7 +94,9 @@ library
     PetReport.Effect.Db.Migrations
     PetReport.Effect.Db.Queries
     PetReport.Effect.Db.Rollup
+    PetReport.Effect.Db.Keepsakes
     PetReport.Effect.Db.Sql
+    PetReport.Effect.Db.State
     PetReport.Effect.Ffmpeg
     PetReport.Effect.Frigate
     PetReport.Effect.Http
@@ -117,6 +119,7 @@ library
     PetReport.Web.Days
     PetReport.Web.Events
     PetReport.Web.Keepsakes
+    PetReport.Web.Facets
     PetReport.Web.Media
     PetReport.Web.Moments
     PetReport.Web.Ops
@@ -188,6 +191,7 @@ test-suite spec
     , llm-harness
     , pet-report
     , servant-server
+    , sqlite-simple
     , stm
     , tasty
     , tasty-hedgehog

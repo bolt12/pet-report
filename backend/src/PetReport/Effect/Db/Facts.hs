@@ -3,8 +3,7 @@
 -- correction, edit, reproject) funnels through 'writeFacts', so no two writers can project
 -- the same perception differently.
 module PetReport.Effect.Db.Facts
-  ( confOf
-  , decodePerception
+  ( decodePerception
   , writeFacts
   , boolToInt
   ) where
@@ -26,14 +25,6 @@ import           PetReport.Domain.Stats         (SubjectFact (..), factsOf)
 -- reprojection share one decoder and one error convention.
 decodePerception :: Text -> Either String Perception
 decodePerception = eitherDecodeStrict . encodeUtf8
-
--- | The value stored in @observations.confidence@: the scene confidence 'factsOf' stamps on
--- every projected fact, or 'Nothing' when there are none (a sound, or a scene with no
--- appearances).
-confOf :: Perception -> Maybe Double
-confOf p = case factsOf p of
-  (f : _) -> sfConfidence f
-  []      -> Nothing
 
 -- | Rewrite an observation's projected subject rows from its perception. Runs on insert,
 -- where there is nothing to delete, and after a correction or edit. Identity stays derived:

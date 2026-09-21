@@ -7,7 +7,8 @@ module Main
 import           Data.Version        (showVersion)
 import           Options.Applicative
 import           Paths_pet_report    (version)
-import           PetReport.App       (App (..), withApp)
+import           PetReport.App       (App (..), RepairScope (..),
+                                      repairStoredPetNames, withApp)
 import qualified PetReport.Effect.Db as Db
 import           PetReport.Trace     (StartupEvent (..), startupTracer,
                                       traceWith)
@@ -47,5 +48,9 @@ main = do
   case cmd of
     Serve -> withApp Web.runServer
     Reproject -> withApp $ \app -> do
+      -- Repair before rebuilding: a reading folded onto its real species projects different
+      -- facts, so the other order would leave the projection describing the readings as
+      -- they were a moment ago.
+      repairStoredPetNames Always app
       n <- Db.reprojectAll (appDb app)
       traceWith (startupTracer (appTracer app)) (Reprojected n)
