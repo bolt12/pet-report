@@ -19,7 +19,7 @@ import           Control.Exception      (fromException)
 import           Control.Monad.IO.Class (liftIO)
 import           Data.Int               (Int64)
 import qualified Data.Map.Strict        as Map
-import           Data.Maybe             (listToMaybe)
+import           Data.Maybe             (listToMaybe, maybeToList)
 import           Data.Set               (Set)
 import qualified Data.Set               as Set
 import           Data.Text              (Text)
@@ -147,7 +147,7 @@ obsViewOf :: App -> UTCTime -> Profile -> Int64 -> IO (Maybe ObsView)
 obsViewOf app now prof oid = do
   obsById <- Db.getObservationsByIds (appDb app) [oid]
   ov <- Db.allAttributionsForObs (appDb app) oid
-  listToMaybe <$> buildObsViews app now prof mempty ov [o | Just o <- [Map.lookup oid obsById]]
+  listToMaybe <$> buildObsViews app now prof mempty ov (maybeToList (Map.lookup oid obsById))
 
 -- | Run a database action reporting success: 200 @{ok:true}@ on 'True', 404 on 'False'.
 okOr404 :: Text -> IO Bool -> Handler OkResp

@@ -748,7 +748,7 @@ domainUnits =
     apBird = (anAppearance (AnAnimal (Species "bird"))) {activity = Alert}
     apPerson = (anAppearance APerson) {activity = Standing}
     eatingCat =
-      (anAppearance (AnAnimal (Species "cat"))) {activity = Eating, behaviors = (normalizeBehaviors Eating noBehaviors)}
+      (anAppearance (AnAnimal (Species "cat"))) {activity = Eating, behaviors = normalizeBehaviors Eating noBehaviors}
     elim t p = noBehaviors {eliminated = Just (Elimination t p)}
     t0 = UTCTime (fromGregorian 2026 7 8) 0
     assertLE a b =
@@ -920,7 +920,7 @@ viewUnits =
     dexter = Pet (PetId "dexter") "Dexter" (Species "cat") "orange cat" Nothing Nothing Nothing
     roster = [dexter]
     eatingCat =
-      (anAppearance (AnAnimal (Species "cat"))) {activity = Eating, behaviors = (normalizeBehaviors Eating noBehaviors)}
+      (anAppearance (AnAnimal (Species "cat"))) {activity = Eating, behaviors = normalizeBehaviors Eating noBehaviors}
     personAp = (anAppearance APerson) {activity = Standing}
     sc1 = emptyScene {appearances = [eatingCat]}
     obs1 = Observation (ObsId 1) t0 (Camera "office") PeriodicSample (Seen sc1) False
@@ -1021,7 +1021,7 @@ contractUnits =
   where
     dexter = Pet (PetId "dexter") "Dexter" (Species "cat") "orange cat" Nothing Nothing Nothing
     t0' = UTCTime (fromGregorian 2026 7 8) 0
-    catAp = (anAppearance (AnAnimal (Species "cat"))) {activity = Eating, behaviors = (normalizeBehaviors Eating noBehaviors)}
+    catAp = (anAppearance (AnAnimal (Species "cat"))) {activity = Eating, behaviors = normalizeBehaviors Eating noBehaviors}
     obs = Observation (ObsId 1) t0' (Camera "office") PeriodicSample (Seen emptyScene {appearances = [catAp]}) False
     ov = viewOf [dexter] mempty (roomOf []) (const (ObsMedia "photo" Nothing Nothing)) obs
     ins = insightsFor utcTZ mempty [] [dexter] t0' dexter [obs]
@@ -1518,7 +1518,7 @@ dbUnits =
                 NewObservation (tk k) (Camera "office") PeriodicSample (Seen emptyScene {appearances = [catAp eat]})
               -- A DOG appearance corrected to the (cat) pet Mochi, so Mochi spans two
               -- detected species: the rollup must SUM both groups into KPet, not drop one.
-              dogAp = (anAppearance (AnAnimal (Species "dog"))) {activity = Sleeping, behaviors = (normalizeBehaviors Sleeping noBehaviors)}
+              dogAp = (anAppearance (AnAnimal (Species "dog"))) {activity = Sleeping, behaviors = normalizeBehaviors Sleeping noBehaviors}
               obsDog k =
                 NewObservation (tk k) (Camera "office") PeriodicSample (Seen emptyScene {appearances = [dogAp]})
               lo = base
@@ -1545,7 +1545,7 @@ dbUnits =
           let base = UTCTime (fromGregorian 2026 7 8) 0
               tk k = addUTCTime (fromInteger (k * 100)) base
               catAp =
-                (anAppearance (AnAnimal (Species "cat"))) {activity = Sleeping, behaviors = (normalizeBehaviors Sleeping noBehaviors)}
+                (anAppearance (AnAnimal (Species "cat"))) {activity = Sleeping, behaviors = normalizeBehaviors Sleeping noBehaviors}
               obsAt k = NewObservation (tk k) (Camera "office") PeriodicSample (Seen emptyScene {appearances = [catAp]})
               lo = base
               hi = addUTCTime 100000 base
@@ -1582,7 +1582,7 @@ dbUnits =
               base = UTCTime (fromGregorian 2026 7 8) 0
               tk k = addUTCTime (fromInteger (k * 100)) base
               catAp act =
-                (anAppearance (AnAnimal (Species "cat"))) {activity = act, behaviors = (normalizeBehaviors act noBehaviors)}
+                (anAppearance (AnAnimal (Species "cat"))) {activity = act, behaviors = normalizeBehaviors act noBehaviors}
               obsAt k act =
                 NewObservation
                   (tk k)
