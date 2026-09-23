@@ -1,5 +1,5 @@
 <script lang="ts">
-  import type { ReviewPreset } from './api'
+  import type { ReviewPreset, TimeOfDayValue } from './api'
 
   // Renders model-written prose with any clock time turned into a link that opens
   // Moments for `date`, narrowed to a small window around that time. XSS-safe: the
@@ -39,7 +39,11 @@
 
   // The server browse filters time-of-day in coarse buckets, so a clicked clock time
   // opens Moments for that day narrowed to its part of the day.
-  function bucketOfMinute(min: number): string {
+  //
+  // These bounds restate the server's, which is a second copy of one rule in a second
+  // language. They are pinned against each other by the wire-vocabulary test rather than
+  // by anything the compiler can see, so keep the two in step.
+  function bucketOfMinute(min: number): TimeOfDayValue {
     if (min >= 5 * 60 && min < 12 * 60) return 'morning'
     if (min >= 12 * 60 && min < 17 * 60) return 'afternoon'
     if (min >= 17 * 60 && min < 21 * 60) return 'evening'
