@@ -6,20 +6,19 @@ module PetReport.Domain.Trends
   , trends
   ) where
 
-import           Data.Map.Strict              (Map)
 import qualified Data.Map.Strict              as Map
 import           Data.Time                    (Day, UTCTime, addDays)
 import           Data.Time.Zones              (TZ)
 import           PetReport.Domain.Observation (Observation (..))
 import           PetReport.Domain.Profile     (Overrides, Roster)
-import           PetReport.Domain.Stats       (PetStat, SubjectKey, presence)
+import           PetReport.Domain.Stats       (ResolvedStats, presence)
 import           PetReport.Domain.Window      (localDayOf)
 
 -- | One local day's slice of the window. 'dtObservations' counts observations, not
 -- appearances, so it need not equal any subject's sightings.
 data DayTrend = DayTrend
   { dtDay          :: Day
-  , dtStats        :: Map SubjectKey PetStat
+  , dtStats        :: ResolvedStats
   , dtObservations :: Int
   }
   deriving stock (Eq, Show)

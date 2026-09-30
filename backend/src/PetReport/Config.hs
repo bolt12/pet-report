@@ -91,6 +91,11 @@ data Config = Config
   , cfgAudioLabels :: [Text]
   -- ^ Frigate audio-detection labels to ingest as sound events (barks, meows,
   -- the doorbell, and safety sounds like a smoke alarm or breaking glass).
+  , cfgPersonLabels :: [Text]
+  -- ^ Frigate object labels ingested as people rather than pets (@person@). Kept apart from
+  -- 'cfgPetLabels' so a human never counts as a pet sighting: identity comes from what the
+  -- model sees in the frame, and a person resolves to its own stats bucket, feeding
+  -- "someone was home" rather than any pet's meals or rest. Empty ingests no people at all.
   , cfgRetentionPollSecs :: NominalDiffTime
   -- ^ How often the retention poller re-reads Frigate's config to refresh the
   -- per-camera media retention that drives a moment's clip-expiry countdown.
@@ -131,6 +136,7 @@ loadConfig = do
   tz      <- envTxt "PET_REPORT_TZ" "UTC"
   cams    <- envTxt "PET_CAMERAS" "office"
   petlbl  <- envTxt "PET_LABELS" "dog,cat"
+  perslbl <- envTxt "PET_REPORT_PERSON_LABELS" "person"
   audio   <- envTxt "PET_AUDIO_LABELS" defaultAudioLabels
   pollsec <- envInt "PET_REPORT_RETENTION_POLL_SECS" (900 :: Int)
   capsec  <- envInt "PET_REPORT_CAPTURE_SECS" (600 :: Int)
@@ -154,6 +160,7 @@ loadConfig = do
           , cfgCameras = map Camera (splitList cams)
           , cfgPetLabels = splitList petlbl
           , cfgAudioLabels = splitList audio
+          , cfgPersonLabels = splitList perslbl
           , cfgRetentionPollSecs = fromIntegral pollsec
           , cfgCaptureSecs = fromIntegral capsec
           , cfgBatchHours = if null batchHours then defaultBatchHours else batchHours

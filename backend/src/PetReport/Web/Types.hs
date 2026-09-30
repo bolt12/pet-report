@@ -21,6 +21,10 @@ module PetReport.Web.Types
   , RecapResp (..)
   , CorrectReq (..)
   , correctionTarget
+  , correctionKinds
+  , AddSightingReq (..)
+  , addedSighting
+  , sightingKinds
   , EditReq (..)
   , KeepsakeReq (..)
   , AddPetReq (..)
@@ -37,23 +41,25 @@ module PetReport.Web.Types
 import           Data.Aeson           (FromJSON (..), ToJSON (..),
                                        genericToJSON, object, withObject,
                                        (.!=), (.:), (.:?), (.=))
+import           Data.Aeson.Types     (Parser)
 import           Data.ByteString      (ByteString)
 import qualified Data.ByteString.Lazy as LBS
 import           Control.Applicative  ((<|>))
 import           Data.Maybe           (fromMaybe)
 import           Data.Text            (Text)
+import qualified Data.Text            as T
 import           Data.Time            (UTCTime)
 import           GHC.Generics         (Generic)
 import qualified Network.HTTP.Media   as M
 import           Servant              (Accept (..), Header, Headers,
                                        MimeRender (..), addHeader)
 
-import           PetReport.Domain.Perception (SceneEdit (..))
+import           PetReport.Domain.Perception (SceneEdit (..), Who (..))
 import           PetReport.Domain.Profile    (CorrectionTarget (..), Pet (..))
 import           PetReport.Domain.Stats      (Presence (..))
 import           PetReport.Domain.Types      (PetId (..), Species (..))
 import           PetReport.Domain.View       (ObsView)
-import           PetReport.Util              (prefixed)
+import           PetReport.Util              (nonBlank, prefixed)
 
 data DayResponse = DayResponse
   { day          :: Text
@@ -167,27 +173,90 @@ newtype RecapResp = RecapResp {recap :: Text}
   deriving stock (Generic)
   deriving anyclass (FromJSON, ToJSON)
 
--- | An owner correction of a mis-identified subject, with exactly one target set. The moment
--- id comes from the request path rather than the body.
-data CorrectReq = CorrectReq
-  { crPetId    :: Maybe Text
-  , crSpecies  :: Maybe Text
-  , crPerson   :: Maybe Bool
-  , crVisiting :: Maybe Bool
-  }
+-- | An owner correction of one mis-identified sighting. Tagged by @kind@, so the body can
+-- carry exactly one target and no combination of flags needs resolving by precedence. The
+-- moment id and the sighting index both come from the request path.
+newtype CorrectReq = CorrectReq CorrectionTarget
 
 instance FromJSON CorrectReq where
-  parseJSON = withObject "CorrectReq" $ \o ->
-    CorrectReq
-      <$> o .:? "petId"
-      <*> o .:? "species"
-      <*> o .:? "person"
-      <*> o .:? "visiting"
+  parseJSON = withObject "CorrectReq" $ \o -> do
+    kind <- o .: "kind"
+    CorrectReq <$> case kind :: Text of
+      "pet"     -> TargetPet <$> o .: "petId"
+      "species" -> TargetSpecies <$> (o .: "species" >>= speciesField)
+      "person"  -> pure TargetPerson
+      "visiting" -> pure TargetVisiting
+      other     -> fail (correctKindError other)
 
--- | Hand the plain identity fields to the roster resolver, keeping the aeson wrapper out of
--- the domain.
+-- | The rejection an unrecognised @kind@ earns, naming the legal set so a client author
+-- reads the answer rather than guessing. Shared with the vocabulary test.
+correctKindError :: Text -> String
+correctKindError other =
+  "unrecognised correction kind "
+    <> show other
+    <> "; expected one of "
+    <> T.unpack (T.intercalate ", " correctionKinds)
+
+-- | The complete @kind@ vocabulary a correction body may carry.
+correctionKinds :: [Text]
+-- @visiting@ names an animal that is not the owner's, and @person@ names a human. They
+-- used to be @visitor@ and @person@, which read as near-synonyms.
+correctionKinds = ["pet", "species", "person", "visiting"]
+
+-- | Hand the decoded target to the roster resolver, keeping the aeson wrapper out of the
+-- domain.
 correctionTarget :: CorrectReq -> CorrectionTarget
-correctionTarget cr = CorrectionTarget (crPetId cr) (crSpecies cr) (crPerson cr) (crVisiting cr)
+correctionTarget (CorrectReq t) = t
+
+-- | A subject the owner says was present but the model did not report: @{ kind: "person" }@
+-- or @{ kind: "species", species: "cat" }@. Only what a camera can perceive, so there is no
+-- pet id here; naming the individual is a separate correction against the new sighting.
+-- | Accept a field only if it holds something once trimmed, naming the field so the message
+-- says which one was empty.
+nonBlankField :: String -> Text -> Parser Text
+nonBlankField field = maybe (fail (field <> " cannot be blank")) pure . nonBlank
+
+-- | The longest species an owner may name. Real ones are one short word; the bound is here
+-- to stop a paste, not to police vocabulary.
+maxSpeciesLen :: Int
+maxSpeciesLen = 40
+
+-- | Accept a species token only if it says something and stays a label. Every wire path that
+-- takes a species goes through here: the two that did not were a card title running off the
+-- screen and a subject row with no label at all, at a different endpoint each.
+speciesField :: Text -> Parser Text
+speciesField raw = do
+  t <- nonBlankField "species" raw
+  if T.length t > maxSpeciesLen
+    then fail ("species is longer than " <> show maxSpeciesLen <> " characters")
+    else pure t
+
+newtype AddSightingReq = AddSightingReq Who
+
+instance FromJSON AddSightingReq where
+  parseJSON = withObject "AddSightingReq" $ \o -> do
+    kind <- o .: "kind"
+    AddSightingReq <$> case kind :: Text of
+      "person"  -> pure APerson
+      -- Bounded and non-blank, because this is the one place an owner writes a species and
+      -- every later reader treats it as one: a blank made a subject row with no label at all,
+      -- and a long one became a card title running off the screen.
+      "species" -> AnAnimal . Species <$> (o .: "species" >>= speciesField)
+      other ->
+        fail
+          ( "unrecognised sighting kind "
+              <> show other
+              <> "; expected one of "
+              <> T.unpack (T.intercalate ", " sightingKinds)
+          )
+
+-- | The complete @kind@ vocabulary an added sighting may carry.
+sightingKinds :: [Text]
+sightingKinds = ["person", "species"]
+
+-- | The perceived subject an add-sighting request names.
+addedSighting :: AddSightingReq -> Who
+addedSighting (AddSightingReq w) = w
 
 -- | An owner field edit of a moment, as a flat all-optional scene edit. The moment id comes
 -- from the request path.
@@ -229,10 +298,14 @@ data AddPetReq = AddPetReq Pet (Maybe Text)
 instance FromJSON AddPetReq where
   parseJSON = withObject "AddPetReq" $ \o ->
     AddPetReq
+      -- Id, name and species all have to say something. A pet is addressed by its id,
+      -- announced by its name and identified by its species, so a blank in any of them makes
+      -- a roster entry the rest of the app cannot use: a nameless card, or a species no
+      -- sighting will ever match.
       <$> ( Pet . PetId
-              <$> o .: "id"
-              <*> o .: "name"
-              <*> (Species <$> o .: "species")
+              <$> (o .: "id" >>= nonBlankField "id")
+              <*> (o .: "name" >>= nonBlankField "name")
+              <*> (Species <$> (o .: "species" >>= speciesField))
               <*> o .: "description"
               <*> o .:? "notes"
               <*> pure Nothing
@@ -255,8 +328,11 @@ data EditPetReq = EditPetReq
 instance FromJSON EditPetReq where
   parseJSON = withObject "EditPetReq" $ \o ->
     EditPetReq
-      <$> o .:? "name"
-      <*> o .:? "species"
+      -- An edit reaches the same roster an add does, so it answers to the same rules. A
+      -- PATCH could blank a pet's name or its species, which is exactly the unusable roster
+      -- entry the add path refuses.
+      <$> (traverse (nonBlankField "name") =<< o .:? "name")
+      <*> (traverse speciesField =<< o .:? "species")
       <*> o .:? "description"
       <*> o .:? "notes"
       <*> o .:? "photo"

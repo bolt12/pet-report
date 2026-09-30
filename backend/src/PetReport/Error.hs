@@ -9,14 +9,17 @@ module PetReport.Error
   , notFound
   , badInput
   , conflict
+  , envelopeFormatters
   ) where
 
 import           Control.Exception    (Exception)
 import           Control.Monad.Except (throwError)
 import           Data.Aeson           (Value, encode, object, (.=))
 import           Data.Text            (Text)
-import           Servant              (Handler, ServerError (..), err400, err404,
-                                       err409, err503)
+import qualified Data.Text            as T
+import           Servant              (ErrorFormatters (..), Handler,
+                                       ServerError (..), defaultErrorFormatters,
+                                       err400, err404, err409, err503)
 
 -- | The application's domain error, raised either in a handler through 'throwAppError' (the
 -- @throwError@ path Servant renders directly) or from effect code as an 'Exception'. The
@@ -63,3 +66,23 @@ notFound, badInput, conflict :: Text -> Handler a
 notFound = throwAppError . NotFound
 badInput = throwAppError . BadInput
 conflict = throwAppError . Conflict
+
+-- | Render Servant's own rejections through the same envelope every handler uses, so a
+-- malformed body or query is @{"error": {"code", "message"}}@ like everything else.
+--
+-- Without this a bad enum in a request body came back as raw aeson prose ("Both branches of
+-- a disjoint union failed: ..."), which the client's error reader cannot parse and no owner
+-- can act on. The underlying text is kept as the message: it names the offending field and
+-- the values that were expected, which is exactly the useful part.
+envelopeFormatters :: ErrorFormatters
+envelopeFormatters =
+  defaultErrorFormatters
+    { bodyParserErrorFormatter = \_ _ -> asEnvelope
+    , urlParseErrorFormatter = \_ _ -> asEnvelope
+    , headerParseErrorFormatter = \_ _ -> asEnvelope
+    }
+  where
+    asEnvelope msg = toServerError (BadInput (tidy msg))
+    -- One line: aeson's disjoint-union report spans several, and a multi-line message
+    -- renders as a wall of internal detail in a toast built for a sentence.
+    tidy = T.unwords . T.words . T.pack

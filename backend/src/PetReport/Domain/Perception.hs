@@ -6,18 +6,24 @@ module PetReport.Domain.Perception
   , SoundKind (..)
   , soundPhrase
   , isSafetySound
+  , safetySoundLabels
   , Scene (..)
   , emptyScene
   , normalizeScene
   , Appearance (..)
+  , anAppearance
+  , sceneAppearances
   , Who (..)
   , isPerson
   , animalSpecies
   , sceneSchema
   , Correction (..)
-  , applyCorrection
+  , applyCorrectionAt
+  , addSighting
+  , removeSightingAt
+  , hasSightingAt
   , SceneEdit (..)
-  , applyEdit
+  , applyEditAt
   ) where
 
 import           Autodocodec               (Autodocodec (..), HasCodec (..),
@@ -29,8 +35,9 @@ import qualified Data.Aeson                as A
 import           Data.Maybe                (fromMaybe)
 import           Data.Text                 (Text)
 import qualified Data.Text                 as T
-import           PetReport.Domain.Behavior (Behaviors (..), normalizeBehaviors)
-import           PetReport.Domain.Types    (Activity, Confidence, PetId,
+import           PetReport.Domain.Behavior (Behaviors (..), noBehaviors,
+                                            normalizeBehaviors)
+import           PetReport.Domain.Types    (Activity (..), Confidence, PetId,
                                             Species (..), Wellbeing (..))
 import           LLM.Schema                (codecSchema)
 
@@ -65,6 +72,15 @@ animalSpecies APerson      = Nothing
 -- retained list. The 'Maybe' forces to its constructor, not its value.
 data Appearance = Appearance
   { who       :: !Who
+  , pet       :: !(Maybe Text)
+  -- ^ Which household pet this is, by name, when the model was sure enough to say. A claim
+  -- about the INDIVIDUAL, where 'who' is only what a camera can perceive.
+  --
+  -- Species alone cannot answer "which of my two dogs is that", and the prompt has always
+  -- asked the model to identify a specific pet when the traits allow. Until this field
+  -- existed the answer had nowhere to go, so it came back inside 'who' and minted a species
+  -- named after the pet. Resolved against the roster at storage, never trusted as a name on
+  -- its own.
   , activity  :: !Activity
   , behaviors :: !Behaviors
   , whereAt   :: !(Maybe Text)
@@ -77,9 +93,27 @@ instance HasCodec Appearance where
     object "Appearance" $
       Appearance
         <$> requiredField "who" "cat / dog / person / other species" .= who
+        -- Optional, so every blob written before the field existed still decodes, and so
+        -- "I cannot tell which one" stays expressible.
+        <*> optionalFieldOrNull "pet" "the household pet's name, only when you are sure which one; null otherwise" .= pet
         <*> requiredField "activity" "the dominant posture or action" .= activity
         <*> requiredField "behaviors" "tracked behaviours for this subject" .= behaviors
         <*> optionalFieldOrNull "where" "location in the room, or null" .= whereAt
+
+-- | The subjects a perception holds: a scene's appearances, and nothing for a sound.
+--
+-- The one place this split is written. It was open-coded at every site that needed it,
+-- including twice inside a single module, each copy a chance for one of them to disagree
+-- about what a sound contains.
+sceneAppearances :: Perception -> [Appearance]
+sceneAppearances (Seen sc) = appearances sc
+sceneAppearances (Heard _) = []
+
+-- | A neutral appearance of @w@: present, with nothing else claimed about it. The owner
+-- asserting presence starts here, and so does any test that only cares who was in frame.
+anAppearance :: Who -> Appearance
+anAppearance w =
+  Appearance {who = w, pet = Nothing, activity = Unclear, behaviors = noBehaviors, whereAt = Nothing}
 
 -- | A visual scene: zero or more per-subject appearances plus scene-level notes.
 -- Strict for the same reason as 'Appearance'; the appearance list forces to its spine.
@@ -101,7 +135,10 @@ instance HasCodec Scene where
         <*> optionalFieldOrNull "notable" "anything genuinely noteworthy, or null" .= notable
         <*> optionalFieldOrNull "description" "one neutral sentence, or null" .= description
         <*> requiredField "wellbeing" "normal / concerning / unclear" .= wellbeing
-        <*> optionalFieldOrNull "confidence" "0.0 to 1.0, or null" .= confidence
+        -- Optional so the blobs written before it was asked for still decode. The
+        -- description no longer offers null as a choice, since the vision prompt requires a
+        -- value; the schema itself cannot demand one without failing on those old rows.
+        <*> optionalFieldOrNull "confidence" "0.0 to 1.0, always present" .= confidence
 
 emptyScene :: Scene
 emptyScene =
@@ -155,10 +192,18 @@ soundPhrase (SoundKind l) = case l of
   "bang"           -> "a bang"
   _                -> T.map (\c -> if c == '_' then ' ' else c) l
 
+-- | The raw Frigate audio labels that count as safety-relevant. Named rather than inlined
+-- because two readers need the same list: 'isSafetySound', and the browse's wellbeing facet,
+-- which has to select the same sounds in SQL that 'wellbeingOf' calls concerning on a card.
+-- While the list lived only here, the Today badge counted a smoke alarm its own link could
+-- not retrieve.
+safetySoundLabels :: [Text]
+safetySoundLabels =
+  ["fire_alarm", "smoke_detector", "smoke_alarm", "co_alarm", "siren", "car_alarm", "glass", "shatter", "breaking"]
+
 -- | Safety-relevant sounds that should raise the daily report's alert priority.
 isSafetySound :: SoundKind -> Bool
-isSafetySound (SoundKind l) =
-  l `elem` ["fire_alarm", "smoke_detector", "smoke_alarm", "co_alarm", "siren", "car_alarm", "glass", "shatter", "breaking"]
+isSafetySound (SoundKind l) = l `elem` safetySoundLabels
 
 data Perception
   = Seen Scene
@@ -183,35 +228,86 @@ instance FromJSON Perception where
 sceneSchema :: Value
 sceneSchema = codecSchema @Scene
 
--- | An owner correction of a mis-identified subject. @ToSpecies@ and @ToPerson@ re-target
--- the animal appearances of a scene, leaving people alone. @ToPet@ and @ToVisiting@ are
--- /individual/ attributions (this exact cat, or a visiting animal that is not mine), stored
--- as overrides at the DB layer and never written into the model-facing scene blob.
+-- | An owner correction of one mis-identified subject. @ToSpecies@ and @ToPerson@ re-target
+-- that sighting inside the scene blob. @ToPet@ and @ToVisiting@ are /individual/
+-- attributions (this exact cat, or a visiting animal that is not mine), stored as overrides
+-- at the DB layer and never written into the model-facing scene blob.
+--
+-- A correction always names the sighting it applies to; see 'applyCorrectionAt'. A moment
+-- holding two cats and a sitter is three sightings, and each is corrected on its own.
 data Correction
   = ToSpecies Species
   | ToPerson
-  | ToPet PetId
+  | -- | Name an individual. Carries the pet's species as well as its id, because naming
+    -- an individual also settles what KIND of thing was seen: if the model called it a dog
+    -- and the owner says it is Mochi the cat, then the species was wrong too. Without the
+    -- species here, the stored reading kept saying dog while the identity said Mochi, so a
+    -- species filter missed a moment a pet filter returned, and naming a mis-read person
+    -- was refused outright.
+    ToPet PetId Species
   | ToVisiting
   deriving stock (Eq, Show)
 
--- | Apply a correction to the stored perception. @ToSpecies@ and @ToPerson@ retarget every
--- animal appearance; a sound is unchanged.
+-- | Retarget the appearance at @ix@, leaving every other sighting in the scene alone.
+-- Out-of-range indices and sounds are left unchanged, so the function is total.
+--
+-- Unlike the scene-wide version this replaced, a correction can turn a person into an
+-- animal and back: the owner picked that exact sighting, so their intent is unambiguous.
 --
 -- @ToPet@ and @ToVisiting@ do NOT touch the blob, which stays species-level so the
 -- @raw_perception@ audit trail and the model schema both survive. Their effect lives in the
 -- @subject_identity@ table and is applied at read time by 'identifyWith'.
-applyCorrection :: Correction -> Perception -> Perception
-applyCorrection (ToSpecies sp) (Seen sc) = Seen sc {appearances = map (retarget (AnAnimal sp)) (appearances sc)}
-applyCorrection ToPerson (Seen sc) = Seen sc {appearances = map (retarget APerson) (appearances sc)}
-applyCorrection _ p = p
+applyCorrectionAt :: Int -> Correction -> Perception -> Perception
+applyCorrectionAt ix corr (Seen sc) =
+  Seen sc {appearances = zipWith retargetOne [0 ..] (appearances sc)}
+  where
+    retargetOne i ap
+      | i /= ix = ap
+      | otherwise = case corr of
+          ToSpecies sp -> ap {who = AnAnimal sp}
+          ToPerson     -> ap {who = APerson}
+          -- Settle the species too, so the reading agrees with the name.
+          ToPet _ sp   -> ap {who = AnAnimal sp}
+          ToVisiting   -> ap
+applyCorrectionAt _ _ p = p
 
-retarget :: Who -> Appearance -> Appearance
-retarget target ap = if isPerson (who ap) then ap else ap {who = target}
+-- | Append a sighting the model did not report, as a neutral appearance of @w@.
+--
+-- The model misses subjects: a person half out of frame, a second cat behind the first. Up
+-- to now the owner could only RETARGET what was reported, so a frame the model read as one
+-- cat could be called a cat or a person and never both. That is the "exclusively one or the
+-- other" the review flow was stuck in.
+--
+-- Appending rather than inserting is what keeps the existing sighting indices valid, so
+-- every identity override already written still points at the subject it was written for.
+-- The activity is 'Unclear' and the behaviours empty because the owner is asserting
+-- PRESENCE, not what the subject was doing; they can edit that afterwards like any other
+-- sighting. A sound has no sightings to add to.
+addSighting :: Who -> Perception -> Perception
+addSighting w (Seen sc) =
+  Seen sc {appearances = appearances sc ++ [anAppearance w]}
+addSighting _ p = p
 
--- | A flat, all-optional owner edit of a scene. Each set field overwrites; an unset field
--- is left unchanged. Activity, location and behaviour flags apply to every /animal/
--- appearance, which is exact for the common single-subject scene. Person appearances and
--- 'Heard' sounds are left alone. Description and wellbeing are scene-level.
+-- | Drop the sighting at @ix@, for a subject the model invented.
+--
+-- This is the one operation that RENUMBERS: every later sighting shifts down one, so the
+-- caller must remap the identity overrides in the same transaction or they will point at
+-- the wrong subjects. 'PetReport.Effect.Db.Queries.removeSighting' is that caller.
+removeSightingAt :: Int -> Perception -> Perception
+removeSightingAt ix (Seen sc) =
+  Seen sc {appearances = [ap | (i, ap) <- zip [0 ..] (appearances sc), i /= ix]}
+removeSightingAt _ p = p
+
+-- | Whether a scene actually holds a sighting at this index. The correction and edit write
+-- paths check this before touching anything, so addressing a sighting that is not there is
+-- a 404 rather than a silent no-op.
+hasSightingAt :: Int -> Perception -> Bool
+hasSightingAt ix (Seen sc) = ix >= 0 && ix < length (appearances sc)
+hasSightingAt _ _          = False
+
+-- | A flat, all-optional owner edit of one sighting. Each set field overwrites; an unset
+-- field is left unchanged. Activity, location and behaviour flags apply to the addressed
+-- sighting alone. Description and wellbeing are scene-level and apply whatever is addressed.
 data SceneEdit = SceneEdit
   { seActivity    :: Maybe Activity
   , seWellbeing   :: Maybe Wellbeing
@@ -225,25 +321,31 @@ data SceneEdit = SceneEdit
   }
   deriving stock (Eq, Show)
 
-applyEdit :: SceneEdit -> Perception -> Perception
-applyEdit e (Seen sc) =
+-- | Apply an edit, with the per-appearance fields landing on sighting @ix@ only. The
+-- scene-level description and wellbeing apply regardless, so an owner can correct the
+-- note on a moment whose sightings they are not touching.
+applyEditAt :: Int -> SceneEdit -> Perception -> Perception
+applyEditAt ix e (Seen sc) =
   Seen
     sc
       { description = maybe (description sc) blankToNothing (seDescription e)
       , wellbeing = fromMaybe (wellbeing sc) (seWellbeing e)
-      , appearances = map (editAppearance e) (appearances sc)
+      , appearances = zipWith editOne [0 ..] (appearances sc)
       }
-applyEdit _ p = p
+  where
+    editOne i ap = if i == ix then editAppearance e ap else ap
+applyEditAt _ _ p = p
 
+-- | Overwrite the set fields of one appearance. A person sighting keeps its behaviour
+-- record: with per-sighting addressing the owner is editing exactly the subject they
+-- picked, so there is no longer a reason to guess that they meant an animal.
 editAppearance :: SceneEdit -> Appearance -> Appearance
-editAppearance e ap
-  | isPerson (who ap) = ap
-  | otherwise =
-      ap
-        { activity = fromMaybe (activity ap) (seActivity e)
-        , whereAt = maybe (whereAt ap) blankToNothing (seWhereAt e)
-        , behaviors = editBehaviors e (behaviors ap)
-        }
+editAppearance e ap =
+  ap
+    { activity = fromMaybe (activity ap) (seActivity e)
+    , whereAt = maybe (whereAt ap) blankToNothing (seWhereAt e)
+    , behaviors = editBehaviors e (behaviors ap)
+    }
 
 editBehaviors :: SceneEdit -> Behaviors -> Behaviors
 editBehaviors e b =

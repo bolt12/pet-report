@@ -14,6 +14,7 @@ import           Data.Aeson             (Value, decodeStrict, object, (.=))
 import           Data.Text              (Text)
 import           Data.Text.Encoding     (encodeUtf8)
 import           Data.Time              (UTCTime, addUTCTime)
+import           Data.Time.Clock.POSIX  (posixSecondsToUTCTime)
 import           Data.Time.Zones        (TZ)
 import           Servant                (Handler)
 
@@ -22,7 +23,8 @@ import qualified PetReport.Analysis.Narrative  as Narrative
 import qualified PetReport.Analysis.IdentGuide as IdentGuide
 import           PetReport.App                 (App (..), appJobs)
 import           PetReport.Domain.Types        (ObsId (..))
-import           PetReport.Domain.Window       (localDayOf, recognizedArg,
+import           PetReport.Domain.Window       (localDayOf, localDayWindow,
+                                                recognizedArg,
                                                 resolveDay)
 import qualified PetReport.Effect.Clock        as Clock
 import qualified PetReport.Effect.Db           as Db
@@ -134,5 +136,54 @@ batchH app mday = liftIO $ do
     Right job -> jobRunning (appJobs app) job
     Left _    -> pure False
   mlast <- Db.getState (appDb app) "last_batch"
+  caught <- caughtUpOn app tz now mday
   let lastVal = mlast >>= (decodeStrict . encodeUtf8) :: Maybe Value
-  pure (object ["running" .= running, "last" .= lastVal])
+  pure (object ["running" .= running, "last" .= lastVal, "caughtUp" .= caught])
+
+-- | Whether every event of the day in question has been looked at yet.
+--
+-- Two ways a day can be finished, and both have to count, because the button this notice
+-- offers takes the second route. A past day is rebuilt by 'Pipeline.buildDay', which sweeps
+-- that day's own window and leaves the global watermark alone, so rebuilding an old day
+-- cannot rewind steady-state ingest. Asking the watermark alone would therefore keep the
+-- notice up on a day the owner had just finished, no matter how often they pressed it.
+--
+-- A finished day (its end is behind us) is caught up once the watermark has passed that end.
+-- The test is against the day's END, never "now": a caught-up system's watermark is
+-- legitimately hours old between batches, so comparing with now would report a finished day
+-- as behind twice a day, every day, and the notice would be noise within a week.
+--
+-- An open day, today, cannot be judged that way: its end is in the future, so the watermark
+-- can never reach it, and comparing with "now" instead would flag today as behind for the
+-- whole gap between batches, since the watermark only touches the present for an instant when
+-- a batch runs. What actually matters is whether outstanding work is piling up, so an open day
+-- reads the drained flag: the last ingest either reached its window's end (nothing outstanding)
+-- or parked on a backlog the owner can act on. A normal between-batch lag is not falling behind.
+--
+-- No watermark at all reads as caught up: a fresh install has nothing outstanding, and saying
+-- otherwise on first run would be a lie the owner cannot act on.
+caughtUpOn :: App -> TZ -> UTCTime -> Maybe Text -> IO Bool
+caughtUpOn app tz now mday = do
+  -- Resolved exactly as 'resolveRefresh' resolves it, so the notice and the refresh button
+  -- can never disagree about which day they mean.
+  let today = localDayOf tz now
+      day = case mday of
+        Just raw | recognizedArg raw -> resolveDay tz now raw
+        _                            -> today
+  swept <- Db.getDaySwept (appDb app) day
+  if swept
+    then pure True
+    else do
+      stored <- Db.getIngestWatermark (appDb app)
+      case stored of
+        Nothing -> pure True
+        Just secs ->
+          -- An open day (today, or later) is judged by the drained flag; a finished day, by
+          -- whether the watermark has passed its end. localDayWindow already clamps a day's
+          -- end to now, so the split is on the calendar day, not that clamped bound.
+          if day >= today
+            then Db.getIngestDrained (appDb app)
+            else do
+              let (_, dayEnd) = localDayWindow tz now day
+                  wm = posixSecondsToUTCTime (realToFrac secs)
+              pure (wm >= dayEnd)

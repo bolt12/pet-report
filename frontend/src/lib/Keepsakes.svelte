@@ -4,7 +4,7 @@
   import Paw from './Paw.svelte'
   import GearButton from './GearButton.svelte'
   import { openLightbox } from './lightbox.svelte'
-  import { fmtTime, friendlyError } from './ui'
+  import { fmtWhen, friendlyError } from './ui'
 
   let { pets, onnav }: { pets: Pet[]; onnav: (s: string) => void } = $props()
 
@@ -61,7 +61,7 @@
           </div>
           <div class="p-[10px]">
             <div class="truncate text-[11.5px] font-extrabold" style="color:var(--text)">{k.caption ?? k.room}</div>
-            <div class="mt-[2px] text-[11px]" style="color:var(--muted)">{fmtTime(k.at)}</div>
+            <div class="mt-[2px] text-[11px]" style="color:var(--muted)">{fmtWhen(k.at)}</div>
           </div>
         </button>
       {/each}

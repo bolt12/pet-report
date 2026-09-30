@@ -403,6 +403,9 @@
       // Auto-detect the browser's zone on first setup; keep the saved one on edit.
       timeZone: seed?.timeZone ?? (Intl.DateTimeFormat().resolvedOptions().timeZone || null),
       gcWindowDays: seed?.gcWindowDays ?? 30,
+      // Not asked for during setup; null follows the server's interval, and it is
+      // adjustable in Settings afterwards.
+      captureSecs: seed?.captureSecs ?? null,
       configuredAt: seed?.configuredAt ?? null,
     }
     try {

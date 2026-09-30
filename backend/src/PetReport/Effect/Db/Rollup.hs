@@ -7,7 +7,6 @@ module PetReport.Effect.Db.Rollup
   , dailyPetStats
   ) where
 
-import           Data.Map.Strict            (Map)
 import qualified Data.Map.Strict            as Map
 import           Data.Text                  (Text)
 import qualified Data.Text                  as T
@@ -16,7 +15,7 @@ import           Database.SQLite.Simple     (Only (..), execute, field, query,
                                              withImmediateTransaction)
 import           Database.SQLite.Simple.FromRow (FromRow (..))
 
-import           PetReport.Domain.Stats     (PetStat (..), SubjectKey (..))
+import           PetReport.Domain.Stats     (StoredStats (..), PetStat (..), SubjectKey (..))
 import           PetReport.Domain.Types     (PetId (..), Species (..))
 import           PetReport.Effect.Db.Handle (Handle, withConn)
 import           PetReport.Effect.Db.Sql    (posixOf)
@@ -46,7 +45,7 @@ materializeDay h day lo hi = withConn h $ \c -> withImmediateTransaction c $ do
 -- | The stored per-subject stats for a local day, keyed exactly as 'subjectStatsBetween'
 -- keys a live window: a specific pet by 'KPet', an unattributed sighting by 'KSpecies'. A
 -- collected day therefore renders through the same code as a live one.
-dailyPetStats :: Handle -> Text -> IO (Map SubjectKey PetStat)
+dailyPetStats :: Handle -> Text -> IO StoredStats
 dailyPetStats h day = withConn h $ \c -> do
   rows <-
     query
@@ -58,6 +57,7 @@ dailyPetStats h day = withConn h $ \c -> do
   -- pet confirmed across two DETECTED species, from a misdetection corrected to it, gives
   -- two rows under the same 'KPet', and their counts must sum rather than overwrite.
   pure $
+    StoredStats $
     Map.fromListWith
       (<>)
       [ (key, ps)

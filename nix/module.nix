@@ -18,6 +18,7 @@ let
     PET_REPORT_TZ = cfg.timeZone;
     PET_CAMERAS = lib.concatStringsSep "," cfg.cameras;
     PET_LABELS = lib.concatStringsSep "," cfg.petLabels;
+    PET_REPORT_PERSON_LABELS = lib.concatStringsSep "," cfg.personLabels;
     PET_REPORT_CAPTURE_SECS = toString cfg.captureSecs;
     PET_REPORT_BATCH_HOURS = lib.concatMapStringsSep "," toString cfg.batchHours;
     PET_REPORT_LOG_LEVEL = cfg.logLevel;
@@ -110,6 +111,15 @@ in
       type = lib.types.listOf lib.types.str;
       default = [ "dog" "cat" ];
       description = "Frigate object labels ingested as pet sightings.";
+    };
+    personLabels = lib.mkOption {
+      type = lib.types.listOf lib.types.str;
+      default = [ "person" ];
+      description = ''
+        Frigate object labels ingested as people rather than pets, so a visit shows up in
+        the day ("someone was home") without ever counting towards a pet's meals or rest.
+        Empty ingests no people at all.
+      '';
     };
     captureSecs = lib.mkOption {
       type = lib.types.ints.positive;

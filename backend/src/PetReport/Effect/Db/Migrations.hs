@@ -1,8 +1,8 @@
 {-# LANGUAGE TemplateHaskell #-}
 
 -- | The versioned schema: the ordered @migrations@ list, applied by @migrate@ at open time,
--- each in its own transaction and gated on @PRAGMA user_version@. There is one entry so far,
--- the initial schema; a future change appends version 2, then 3, and so on.
+-- each in its own transaction and gated on @PRAGMA user_version@. Two entries so far, the
+-- initial schema and the needs-look column; a future change appends version 3, and so on.
 --
 -- Kept apart from "PetReport.Effect.Db.Queries" so the handle can run migrations without
 -- pulling in every query.
@@ -12,6 +12,8 @@ module PetReport.Effect.Db.Migrations
   , latestSchemaVersion
   , schemaTooNew
   , unversionedButPopulated
+  , ObservedSchema (..)
+  , inferSchemaVersion
   , schemaV1Tables
   , migrations
   ) where
@@ -22,8 +24,8 @@ import           Data.List              (sort)
 import           Data.Maybe             (listToMaybe, mapMaybe)
 import           Data.Text              (Text)
 import qualified Data.Text              as T
-import           Database.SQLite.Simple (Connection, Query (..), execute_,
-                                         fromOnly, query_,
+import           Database.SQLite.Simple (Connection, Only (..), Query (..),
+                                         execute_, fromOnly, query, query_,
                                          withImmediateTransaction)
 
 import           PetReport.Trace (DbEvent (..), Tracer, traceWith)
@@ -46,7 +48,7 @@ migrate tracer c = do
   -- table the operator never asked about. Only look inside when the stamp is 0, which
   -- keeps this off the common startup path.
   when (cur == 0) $
-    refuse SchemaUnversioned . unversionedButPopulated =<< userTables c
+    refuse SchemaUnversioned . unversionedButPopulated =<< observedSchema c
   forM_ migrations $ \(v, stmts) ->
     when (cur < v) $ do
       traceWith tracer (ApplyingMigration v)
@@ -117,24 +119,58 @@ userTables c =
 -- healthy database lands here, so "remove the file" would be advice to delete live data.
 -- Lead with restoring the stamp, and only suggest moving the file aside when it turns out
 -- not to be a pet-report database at all.
-unversionedButPopulated :: [Text] -> Maybe String
-unversionedButPopulated [] = Nothing
-unversionedButPopulated tables
-  | tables == schemaV1Tables =
-      Just $
-        "database holds exactly the tables this build's schema creates but carries no \
-        \schema version, so it is almost certainly a pet-report database that lost its \
-        \stamp. Restoring a backup through sqlite3's .dump and .read does that (VACUUM \
-        \does not). Put the stamp back with \"PRAGMA user_version = "
-          <> show latestSchemaVersion
-          <> "\" and restart. Do not delete the file: the data is intact."
-  | otherwise =
-      Just $
-        "database holds tables ("
-          <> T.unpack (T.intercalate ", " tables)
-          <> ") but carries no schema version, and they are not this build's schema ("
-          <> T.unpack (T.intercalate ", " schemaV1Tables)
-          <> "), so it cannot be adopted. Move the file aside and restart to recreate it."
+unversionedButPopulated :: ObservedSchema -> Maybe String
+unversionedButPopulated os
+  | null (osTables os) = Nothing
+  | Just v <- inferSchemaVersion os = Just (lostStamp v)
+  | otherwise = Just notOurs
+  where
+    lostStamp v =
+      "database holds exactly the tables this build's schema creates but carries no \
+      \schema version, so it is almost certainly a pet-report database that lost its \
+      \stamp. Restoring a backup through sqlite3's .dump and .read does that (VACUUM \
+      \does not). Put the stamp back with \"PRAGMA user_version = "
+        <> show v
+        <> "\" and restart. Do not delete the file: the data is intact."
+    notOurs =
+      "database holds tables ("
+        <> T.unpack (T.intercalate ", " (osTables os))
+        <> ") but carries no schema version, and they are not this build's schema ("
+        <> T.unpack (T.intercalate ", " schemaV1Tables)
+        <> "), so it cannot be adopted. Move the file aside and restart to recreate it."
+
+-- | What an unstamped database looks like from outside: the tables it holds, and the columns
+-- of @observations@, which is the only place two known versions differ.
+data ObservedSchema = ObservedSchema
+  { osTables     :: [Text]
+  , osObsColumns :: [Text]
+  }
+  deriving stock (Eq, Show)
+
+-- | Which schema version an unstamped database looks like, or 'Nothing' when it is not one
+-- of ours at all.
+--
+-- Table names alone cannot answer this. Version 2 only renames a column, so a v1 and a v2
+-- database hold exactly the same tables, and naming the latest version regardless would tell
+-- the owner of a v1 file to stamp 2: the runner would then skip migration 2 and every
+-- needs-look query would hit a column that was never renamed.
+--
+-- The table comparison assumes no migration has ADDED a table since v1. The first one that
+-- does needs its discriminator here too, or a dump of the older schema lands in 'notOurs'.
+inferSchemaVersion :: ObservedSchema -> Maybe Int
+inferSchemaVersion os
+  | osTables os /= schemaV1Tables = Nothing
+  | "needs_look" `elem` osObsColumns os = Just 2
+  | otherwise = Just 1
+
+-- | Read an unstamped database's shape for 'unversionedButPopulated'.
+observedSchema :: Connection -> IO ObservedSchema
+observedSchema c = ObservedSchema <$> userTables c <*> tableColumns c "observations"
+
+-- | One table's column names, through @pragma_table_info@ as a table-valued function so the
+-- table name binds as a parameter instead of being spliced into the SQL.
+tableColumns :: Connection -> Text -> IO [Text]
+tableColumns c t = map fromOnly <$> query c "SELECT name FROM pragma_table_info(?)" (Only t)
 
 -- | The tables the initial schema creates, recovered from the same embedded DDL
 -- 'migrations' applies, so the list updates itself when the schema changes. Sorted to match
@@ -149,14 +185,22 @@ schemaV1Tables = sort (mapMaybe tableName (parseStatements schemaV1))
       _                                                                  -> Nothing
 
 migrations :: [(Int, [Query])]
-migrations = [(1, parseStatements schemaV1)]
+migrations =
+  [ (1, parseStatements schemaV1)
+  , (2, parseStatements schemaV2)
+  ]
 
 -- | The initial schema, embedded from @sql/0001_initial.sql@ at compile time. The DDL lives
 -- in a diffable, syntax-highlighted @.sql@ file while the binary stays self-contained, with
--- no runtime data-file dependency. A future version adds @sql/0002_*.sql@ and a @(2, ...)@
+-- no runtime data-file dependency. A future version adds @sql/0003_*.sql@ and a @(3, ...)@
 -- entry to 'migrations'.
 schemaV1 :: Text
 schemaV1 = $(makeRelativeToProject "sql/0001_initial.sql" >>= embedStringFile)
+
+-- | Version 2: @observations.uncertain@ becomes @needs_look@ and widens to include the
+-- moments flagged concerning, so the review backlog holds everything the Today badge counts.
+schemaV2 :: Text
+schemaV2 = $(makeRelativeToProject "sql/0002_needs_look.sql" >>= embedStringFile)
 
 -- | Split a @.sql@ script into its statements. Whole-line @--@ comments go FIRST, so a @;@
 -- inside a comment cannot end a statement; then split on @;@, trim, and drop empty chunks.
