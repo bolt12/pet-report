@@ -1,0 +1,28 @@
+pet-report promo videos: media credits
+
+Music
+  "Tears of Joy" by Michael Ramir C., from Mixkit
+  https://mixkit.co/free-stock-music/ (track 839), Mixkit Stock Music Free License.
+  Check the current licence terms on mixkit.co/license before posting.
+
+Stock footage
+  All footage is from Pexels, used under the Pexels License
+  (https://www.pexels.com/license/): free to use and modify, attribution not
+  required. Listed here so each clip can be traced back to its source.
+
+  The demo household: Waffle the beagle, Miso the ginger cat
+    Beagle puppy series, Kampus Production:
+      https://www.pexels.com/video/8056019/  8056026  8056259  8056261  8056263
+      8056264  8056265  8056266  8056267  8056271  8056272  8056274  8056276
+      8056277  8056523  8056531  (same URL pattern: pexels.com/video/<id>/)
+    Ginger cat, cottonbro studio: https://www.pexels.com/video/6853902/  6853962
+    Ginger kitten, Nothing Ahead: https://www.pexels.com/video/13925471/
+    Kitten drinking, Meaw Zara:
+      https://www.pexels.com/video/a-kitten-drinking-from-a-bowl-of-water-17363299/
+    Black cat on the bed, cottonbro studio: https://www.pexels.com/video/6864599/
+
+App footage
+  The real pet-report UI (branch bolt12/1) running on a local demo instance
+  seeded with the footage above.
+
+Fonts: Fredoka and Nunito (SIL Open Font License), the same faces the app uses.

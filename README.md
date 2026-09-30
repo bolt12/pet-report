@@ -2,6 +2,8 @@
 
 **A self-hosted daily journal of how your pets are doing while you're out, written by a vision model that runs on your own hardware.**
 
+https://github.com/user-attachments/assets/06755b27-b252-4462-b0e5-e304b2bbd5c3
+
 I have a cat and a dog, and whenever I travel I worry about them. A pet sitter
 helps, but a sitter only catches the obvious: an empty bowl, a litter tray that
 needs changing. The subtle things slip past. My cameras aren't much better. They
@@ -21,7 +23,7 @@ scroll through. So I built pet-report to answer those questions instead.
   <img src="docs/screenshots/moments.png" width="262" alt="Moments: the browsable timeline with moments flagged for review on top">
 </p>
 <p align="center">
-  <img src="docs/screenshots/lightbox.png" width="262" alt="A moment opened: the photo, the model's confidence, and one-tap corrections">
+  <img src="docs/screenshots/lightbox.png" width="262" alt="A moment opened: the clip, the model's confidence, and one-tap corrections">
   <img src="docs/screenshots/ask.png" width="262" alt="Ask: a free-form question answered from stored observations, with the moments it used">
   <img src="docs/screenshots/onboarding-2.png" width="262" alt="Setup: describe each pet, or attach a photo and have the description written for you">
 </p>
@@ -29,9 +31,9 @@ scroll through. So I built pet-report to answer those questions instead.
   <img src="docs/screenshots/desktop-today.png" alt="The desktop layout: sidebar navigation and the day's highlights">
 </p>
 
-*The screenshots show a demo household. The pet photos come from
-[cataas.com](https://cataas.com) and [dog.ceo](https://dog.ceo); point it at
-your own cameras and it fills with your animals instead.*
+*The screenshots show a demo household, filmed with stock footage from
+[Pexels](https://www.pexels.com/license/); point it at your own cameras and it
+fills with your animals instead.*
 
 ## What it is
 
